@@ -61,7 +61,7 @@ def is_valid_sequence(text):
     content = text[start_pos:]
 
     # Check for balanced tags
-    tags_to_check = ["think", "search", "information", "answer"]
+    tags_to_check = ["think", "tool_response", "answer"]
     for tag in tags_to_check:
         opening_count = len(re.findall(f"<{tag}>", content))
         closing_count = len(re.findall(f"</{tag}>", content))
@@ -71,7 +71,7 @@ def is_valid_sequence(text):
     # Now check for proper sequence pattern and no extraneous content
 
     # 1. First split the content by any tags we recognize
-    split_pattern = r"(</?(?:think|search|information|answer)>)"
+    split_pattern = r"(</?(?:think|search|answer)>)"
     parts = re.split(split_pattern, content)
 
     # 2. Keep track of the current position in the expected sequence
@@ -131,7 +131,7 @@ def extract_solution(solution_str):
     matches = list(match)
 
     # If there are 0 or exactly 1 matches, return None
-    if len(matches) <= 1:
+    if len(matches) < 1:
         return None
 
     # If there are 2 or more matches, return the last one
@@ -139,7 +139,9 @@ def extract_solution(solution_str):
 
 
 def extract_information_blocks(text: str) -> list[str]:
-    pattern = r"<information>(.*?)</information>"
+    # pattern = r"<tool_response>(.*?)</tool_response>"
+    # [Result: ]
+    pattern = r"\[Result:(.*?)\]"
     matches = re.findall(pattern, text, re.DOTALL)
     return [match.strip() for match in matches]
 
@@ -173,17 +175,26 @@ def compute_score_em(
         score: the score for the correct answer
     """
     is_valid_format, _ = is_valid_sequence(solution_str)
+    # print("is_valid_format:", is_valid_format)
     retrieval_correct = False
     if is_valid_format:
         retrieval_correct = is_retrieval_correct(solution_str, ground_truth["target"])
     answer = extract_solution(solution_str=solution_str)
     do_print = random.randint(1, 64) == 1
+    # do_print = True
 
     if do_print:
         print("--------------------------------")
         print(f"Golden answers: {ground_truth['target']}")
         print(f"Extracted answer: {answer}")
         print(f"Solution string: {solution_str}")
+
+        # write to log as well
+        with open("/var/log/qa_em_format.log", "w") as f:
+            f.write("--------------------------------\n")
+            f.write(f"Golden answers: {ground_truth['target']}\n")
+            f.write(f"Extracted answer: {answer}\n")
+            f.write(f"Solution string: {solution_str}\n")
 
     if answer is None:
         if is_valid_format:

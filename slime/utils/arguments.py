@@ -647,6 +647,39 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--n-samples-per-prompt", type=int, default=1, help="Number of responses for each prompt in generation"
             )
 
+            # progressive rollout arguments
+            parser.add_argument(
+                "--n-samples-per-prompt-max",
+                type=int,
+                default=None,
+                help=(
+                    "Maximum number of samples to generate per prompt in progressive rollout. "
+                    "When set, enables progressive rollout mode where samples are generated in strides "
+                    "of --n-samples-per-prompt-stride and early-stopped when a good training group can be assembled."
+                ),
+            )
+            parser.add_argument(
+                "--n-samples-per-prompt-stride",
+                type=int,
+                default=None,
+                help=(
+                    "Number of samples to generate per stride in progressive rollout. "
+                    "After each stride, the system checks if a training group can be assembled."
+                ),
+            )
+            parser.add_argument(
+                "--progressive-rollout-pos-ratio-min",
+                type=float,
+                default=0.25,
+                help="Minimum fraction of positive-reward samples in a training group for progressive rollout.",
+            )
+            parser.add_argument(
+                "--progressive-rollout-pos-ratio-max",
+                type=float,
+                default=0.75,
+                help="Maximum fraction of positive-reward samples in a training group for progressive rollout.",
+            )
+
             # gbs of the training, note that the gbs is of sample, not of prompts,
             # so if you hope to train 1 step for each rollout, the global_bach_size should be set as
             # `rollout_batch_size * n_samples_per_prompt`.
@@ -658,6 +691,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Number of steps per rollout, e.g. It is equivalent to setting gbs as "
                     "`rollout_batch_size * n_samples_per_prompt // num_steps_per_rollout`."
+                ),
+            )
+            parser.add_argument(
+                "--ppo-epochs",
+                type=int,
+                default=1,
+                help=(
+                    "Number of PPO epochs: how many times to iterate over the SAME rollout batch "
+                    "per rollout. 1 (default) is on-policy single-pass. Values > 1 reuse the data "
+                    "(off-policy passes corrected by the PPO importance-ratio clip); the LR "
+                    "schedule still advances once per rollout, not per epoch."
                 ),
             )
             # mbs for the training, will be ignored if `use_dynamic_batch_size` is set.
@@ -763,6 +807,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--eval-max-prompt-len", type=int, default=None)
             parser.add_argument("--eval-min-new-tokens", type=int, default=None)
             parser.add_argument("--eval-max-context-len", type=int, default=None)
+            parser.add_argument(
+                "--eval-task-timeout",
+                type=float,
+                default=None,
+                help="Timeout in seconds for each eval task batch. Stuck tasks are cancelled after this.",
+            )
+            parser.add_argument(
+                "--eval-max-concurrency",
+                type=int,
+                default=128,
+                help="Maximum number of concurrent eval generations. If not set, there is no cap.",
+            )
 
             return parser
 
@@ -835,6 +891,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="lower bound of the value for Dual-clip PPO from https://arxiv.org/pdf/1912.09729",
             )
             parser.add_argument("--value-clip", type=float, default=0.2, help="the clip for value loss")
+            parser.add_argument(
+                "--no-actor",
+                action="store_true",
+                default=False,
+                help=(
+                    "Critic-only training: skip creating and loading the actor model entirely "
+                    "to save GPU memory. Requires PPO (--advantage-estimator ppo) and "
+                    "--debug-train-only / --load-debug-rollout-data (no online rollout)."
+                ),
+            )
             parser.add_argument(
                 "--kl-coef",
                 type=float,
@@ -930,6 +996,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--entropy-coef", type=float, default=0.0, help="Entropy loss coef")
             parser.add_argument("--gamma", type=float, default=1.0, help="PPO GAE gamma")
             parser.add_argument("--lambd", type=float, default=1.0, help="PPO GAE lambd")
+            parser.add_argument(
+                "--grpo-per-step-discount",
+                action="store_true",
+                default=False,
+                help=(
+                    "When set, discount the GRPO/GSPO trajectory reward by `gamma` per agent step. "
+                    "An 'agent step' is one contiguous run of loss_mask==1 tokens (i.e. one "
+                    "assistant turn). For a trajectory with N steps and terminal reward R, step k "
+                    "(0-indexed from the first step) receives return gamma**(N-1-k) * R."
+                ),
+            )
             parser.add_argument("--normalize-advantages", action="store_true", default=False)
             parser.add_argument(
                 "--disable-grpo-std-normalization",
@@ -1058,10 +1135,94 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--opd-mode",
+                type=str,
+                choices=["reward", "loss"],
+                default="loss",
+                help=(
+                    "How the on-policy distillation KL signal is injected into training. These "
+                    "two modes are mutually exclusive to avoid applying the teacher signal twice. "
+                    "'reward': the reverse-KL penalty is subtracted from advantages before the "
+                    "policy-gradient loss (apply_opd_kl_to_advantages), so distillation flows "
+                    "through the advantage/return of the chosen estimator (GRPO, PPO, ...). "
+                    "'loss': the OPD objective is added as a separate differentiable loss term "
+                    "(reverse-KL / top-k forward-KL surrogates) on top of the policy loss and the "
+                    "advantages are left untouched. Only takes effect when --use-opd is enabled. "
+                    "Default is 'loss'."
+                ),
+            )
+            parser.add_argument(
+                "--opd-reward-type",
+                type=str,
+                choices=["k1", "k3", "js_skew"],
+                default="k1",
+                help=(
+                    "Distillation reward added to advantages when --opd-mode=reward. "
+                    "'k1' uses teacher_logp - student_logp (matches the original reverse-KL "
+                    "advantage penalty); 'k3' uses -exp(teacher_logp - student_logp); 'js_skew' "
+                    "uses +log(lam * exp(teacher_logp - student_logp) + (1 - lam)) = log(m_lambda/pi_s) "
+                    "with lam = --opd-js-mixture-weight (a proper reward; at lam=1 it reduces to the k1 "
+                    "reward). Ignored when --opd-mode=loss. Default is 'k1'."
+                ),
+            )
+            parser.add_argument(
                 "--opd-kl-coef",
                 type=float,
                 default=1.0,
                 help="On-policy distillation KL penalty coefficient. Default is 1.0.",
+            )
+            parser.add_argument(
+                "--opd-reverse-kl-loss-type",
+                type=str,
+                choices=["k1", "k2", "k3", "js_skew"],
+                default="k2",
+                help=(
+                    "Surrogate used for the single-token reverse-KL OPD objective. "
+                    "'k1' uses a detached reverse-KL coefficient times the student log-prob; "
+                    "'k2' uses 0.5 * (log pi_s - log pi_t)^2; "
+                    "'k3' uses exp(log pi_t - log pi_s) - 1 + log pi_s - log pi_t. "
+                    "'js_skew' uses the skew (generalized) JS divergence with mixture "
+                    "m = (1 - opd_js_mixture_weight) * pi_s + opd_js_mixture_weight * pi_t; it "
+                    "reduces to 'js' at opd_js_mixture_weight=0.5 and interpolates toward reverse "
+                    "KL as the weight -> 1 (deeper down-push on student-over-confident tokens). "
+                    "Default is k2."
+                ),
+            )
+            parser.add_argument(
+                "--opd-js-mixture-weight",
+                type=float,
+                default=0.5,
+                help=(
+                    "Teacher weight lambda in (0, 1] for the 'js_skew' OPD loss mixture "
+                    "m_lambda = (1 - lambda) * pi_s + lambda * pi_t. The per-token reward is "
+                    "log(m_lambda / pi_s) (score-function surrogate, coefficient -log u), so "
+                    "lambda=1 recovers the reverse-KL (k1) surrogate exactly and "
+                    "smaller lambda softens it toward the mode-mixture direction, bounding the "
+                    "down-push on student-over-confident tokens (w -> 0) at log(1 - lambda). "
+                    "Overall scale is absorbed by opd_kl_coef. Default 0.5."
+                ),
+            )
+            parser.add_argument(
+                "--opd-js-ratio-clamp-min",
+                type=float,
+                default=0.0,
+                help=(
+                    "Lower clamp for the JS importance ratio q/p (default 0.0 = one-sided, "
+                    "original behavior). The 'js' loss clamps q/p at max=10 on the q>p side but "
+                    "leaves the q<p side free to collapse toward 0, tilting symmetric JS toward "
+                    "mode-covering forward KL. Setting a small floor (e.g. 0.1) keeps the "
+                    "mode-seeking branch alive."
+                ),
+            )
+            parser.add_argument(
+                "--zero-train-adv-for-opd",
+                action="store_true",
+                default=False,
+                help=(
+                    "Zero out base advantages before applying OPD KL penalty, so the "
+                    "effective loss signal is KL-only (no reward-based advantage term). "
+                    "Only takes effect when --use-opd is enabled."
+                ),
             )
             parser.add_argument(
                 "--opd-teacher-load",
@@ -1074,6 +1235,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             parser.add_argument(
                 "--opd-teacher-ckpt-step", type=int, default=None, help="The checkpoint step for OPD teacher model."
+            )
+            parser.add_argument(
+                "--opd-config",
+                type=str,
+                default=None,
+                help=(
+                    "Path to an OPD YAML config (see slime/rollout/opd_config.py). When set, it provides the "
+                    "teacher endpoint, tokenizer, cross-vocab alignment, top-k and truncation settings used by "
+                    "the sglang OPD reward function. Overrides the legacy --rm-url/--rm-tokenizer-path/--opd-kl-coef."
+                ),
             )
             return parser
 
@@ -1705,6 +1876,11 @@ def slime_validate_args(args):
                     "--opd-teacher-load should not be set when --opd-type=sglang. "
                     "In sglang mode, teacher log-probs are obtained from external server during rollout."
                 )
+            if getattr(args, "opd_config", None) is not None:
+                if not os.path.exists(args.opd_config):
+                    raise FileNotFoundError(
+                        f"--opd-config path {args.opd_config!r} does not exist."
+                    )
     else:
         # If OPD is not enabled, opd_teacher_load should not be set
         if args.opd_teacher_load is not None:
@@ -1751,6 +1927,15 @@ def slime_validate_args(args):
             "require advantage normalization. Please add `--normalize-advantages` to your command."
         )
 
+    if getattr(args, "grpo_per_step_discount", False):
+        assert args.advantage_estimator in ["grpo", "gspo"], (
+            "--grpo-per-step-discount is only supported with the 'grpo' or 'gspo' advantage "
+            f"estimator, got '{args.advantage_estimator}'."
+        )
+        assert 0.0 < args.gamma <= 1.0, (
+            f"--grpo-per-step-discount requires 0 < gamma <= 1, got gamma={args.gamma}."
+        )
+
     if args.use_rollout_logprobs:
         assert not args.use_tis, "use_rollout_logprobs and use_tis cannot be set at the same time."
 
@@ -1790,6 +1975,13 @@ def slime_validate_args(args):
     # Critic always uses the same GPU count as actor.
     args.critic_num_gpus_per_node = args.actor_num_gpus_per_node
     args.critic_num_nodes = args.actor_num_nodes
+
+    if args.no_actor:
+        assert args.use_critic, "--no-actor requires --advantage-estimator ppo (critic training)."
+        assert args.debug_train_only, (
+            "--no-actor requires --debug-train-only / --load-debug-rollout-data "
+            "since there is no policy to serve for online rollout."
+        )
 
     if args.offload:
         args.offload_train = True
@@ -1850,6 +2042,8 @@ def slime_validate_args(args):
             )
         args.global_batch_size = global_batch_size
 
+    assert args.ppo_epochs >= 1, f"ppo_epochs must be >= 1, got {args.ppo_epochs}"
+
     if args.n_samples_per_prompt == 1:
         args.grpo_std_normalization = False
         logger.info("n_samples_per_prompt is set to 1, grpo_std_normalization will be set to False.")
@@ -1861,6 +2055,34 @@ def slime_validate_args(args):
         f"over_sampling_batch_size {args.over_sampling_batch_size} should be greater than or equal to "
         f"rollout_batch_size {args.rollout_batch_size}"
     )
+
+    # Validate progressive rollout arguments
+    if args.n_samples_per_prompt_max is not None:
+        assert args.n_samples_per_prompt_stride is not None, (
+            "--n-samples-per-prompt-stride must be set when --n-samples-per-prompt-max is set"
+        )
+        assert args.n_samples_per_prompt_max > args.n_samples_per_prompt, (
+            f"n_samples_per_prompt_max ({args.n_samples_per_prompt_max}) must be greater than "
+            f"n_samples_per_prompt ({args.n_samples_per_prompt})"
+        )
+        assert args.n_samples_per_prompt_stride > 0, (
+            f"n_samples_per_prompt_stride ({args.n_samples_per_prompt_stride}) must be positive"
+        )
+        assert args.n_samples_per_prompt_max % args.n_samples_per_prompt_stride == 0, (
+            f"n_samples_per_prompt_max ({args.n_samples_per_prompt_max}) must be a multiple of "
+            f"n_samples_per_prompt_stride ({args.n_samples_per_prompt_stride})"
+        )
+        assert 0.0 <= args.progressive_rollout_pos_ratio_min <= args.progressive_rollout_pos_ratio_max <= 1.0, (
+            f"progressive_rollout_pos_ratio_min ({args.progressive_rollout_pos_ratio_min}) and "
+            f"progressive_rollout_pos_ratio_max ({args.progressive_rollout_pos_ratio_max}) must satisfy "
+            "0 <= min <= max <= 1"
+        )
+        logger.info(
+            f"Progressive rollout enabled: max={args.n_samples_per_prompt_max}, "
+            f"stride={args.n_samples_per_prompt_stride}, "
+            f"train={args.n_samples_per_prompt}, "
+            f"pos_ratio=[{args.progressive_rollout_pos_ratio_min}, {args.progressive_rollout_pos_ratio_max}]"
+        )
 
     if args.num_epoch is not None:
         if args.num_rollout is not None:

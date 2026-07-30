@@ -303,6 +303,10 @@ def log_rollout_data(
                 "global_batch_sizes",
                 "num_microbatches",
                 "micro_batch_indices",
+                "teacher_valid_mask",
+                "teacher_topk_logprobs",
+                "teacher_topk_ids",
+                "teacher_topk_rank",
             ]:
                 continue
             # Emit (sum, count) so gather_log_data can do a weighted average across

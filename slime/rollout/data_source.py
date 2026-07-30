@@ -105,14 +105,23 @@ class RolloutDataSource(DataSource):
             prompt_samples = [Sample() for _ in range(num_samples)]
 
         samples = []
+        # Progressive rollout synthesizes extra samples per group with indices
+        # ``base_index + i`` for ``i`` up to ``n_samples_per_prompt_max``. Reserve a
+        # block of that size per group so those synthetic indices cannot overlap the
+        # next group's indices (which would merge their group_ids and drop the
+        # effective group count below global_batch_size).
+        max_per_group = getattr(self.args, "n_samples_per_prompt_max", None)
+        index_stride_per_group = max(self.args.n_samples_per_prompt, max_per_group or 0)
         for prompt_sample in prompt_samples:
             group = []
+            group_base_index = self.sample_index
             for _ in range(self.args.n_samples_per_prompt):
                 sample = copy.deepcopy(prompt_sample)
                 sample.group_index = self.sample_group_index
                 sample.index = self.sample_index
                 self.sample_index += 1
                 group.append(sample)
+            self.sample_index = group_base_index + index_stride_per_group
             self.sample_group_index += 1
             samples.append(group)
         return samples

@@ -1,0 +1,1723 @@
+diff --git a/slime/backends/megatron_utils/actor.py b/slime/backends/megatron_utils/actor.py
+index 155324ff..08d6059e 100644
+--- a/slime/backends/megatron_utils/actor.py
++++ b/slime/backends/megatron_utils/actor.py
+@@ -488,19 +488,34 @@ class MegatronTrainRayActor(TrainRayActor):
+                 rollout_data,
+             )
+ 
+-            # Train
++            # Train. --ppo-epochs > 1 reuses this rollout's data for multiple gradient
++            # passes (standard PPO): advantages and the old-policy baseline were computed
++            # once above and live read-only in rollout_data, and train() re-reads them via
++            # the data_iterator (resetting it each call), so re-running it is a correct
++            # multi-epoch update. Guards mirror OpenWebRL — a fixed old-policy baseline
++            # requires --use-rollout-logprobs (otherwise the num_microbatches==1 loss reuse
++            # would use the moving in-forward logprobs), and the reuse path is actor-only.
++            if self.args.ppo_epochs > 1:
++                if not self.args.use_rollout_logprobs:
++                    raise ValueError("--ppo-epochs > 1 requires --use-rollout-logprobs (fixed IS baseline across epochs).")
++                if self.args.use_routing_replay or self.args.use_rollout_routing_replay:
++                    raise NotImplementedError("--ppo-epochs > 1 does not support routing replay.")
++                if self.args.use_critic:
++                    raise NotImplementedError("--ppo-epochs > 1 is actor-only (no critic).")
+             if self.args.use_routing_replay:
+                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
+             with timer("actor_train"):
+-                train(
+-                    rollout_id,
+-                    self.model,
+-                    self.optimizer,
+-                    self.opt_param_scheduler,
+-                    data_iterator,
+-                    num_microbatches,
+-                    global_batch_sizes,
+-                )
++                for _ppo_epoch_id in range(self.args.ppo_epochs):
++                    train(
++                        rollout_id,
++                        self.model,
++                        self.optimizer,
++                        self.opt_param_scheduler,
++                        data_iterator,
++                        num_microbatches,
++                        global_batch_sizes,
++                        ppo_epoch_id=_ppo_epoch_id,
++                    )
+ 
+             self.prof.step(rollout_id=rollout_id)
+ 
+diff --git a/slime/backends/megatron_utils/data.py b/slime/backends/megatron_utils/data.py
+index 51b008d1..af251c97 100644
+--- a/slime/backends/megatron_utils/data.py
++++ b/slime/backends/megatron_utils/data.py
+@@ -12,6 +12,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
+ from slime.utils import train_metric_utils
+ from slime.utils.flops_utils import calculate_fwd_flops
+ from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step
++from slime.utils.processing_utils import load_tokenizer
+ from slime.utils.types import RolloutBatch
+ 
+ from ...utils import logging_utils
+@@ -24,6 +25,10 @@ from .cp_utils import (
+ 
+ logger = logging.getLogger(__name__)
+ 
++# Cache the resolved <|image_pad|> token id per tokenizer path (see
++# log_megatron_image_token_debug) so we only tokenize the probe string once.
++_IMAGE_PAD_TOKEN_ID_CACHE: dict[str, int | None] = {}
++
+ 
+ def get_batch(
+     data_iterator: "DataIterator",
+@@ -245,6 +250,123 @@ def get_data_iterator(rollout_data: RolloutBatch) -> list[DataIterator]:
+     return [DataIterator(rollout_data, micro_batch_indices) for _ in range(vpp_size)]
+ 
+ 
++def _get_image_pad_token_id(args: Namespace) -> int | None:
++    """Resolve the tokenizer id of ``<|image_pad|>`` (Qwen-VL), cached per checkpoint."""
++    tokenizer_model = getattr(args, "hf_checkpoint", None)
++    if not tokenizer_model:
++        return None
++    if tokenizer_model in _IMAGE_PAD_TOKEN_ID_CACHE:
++        return _IMAGE_PAD_TOKEN_ID_CACHE[tokenizer_model]
++
++    token_id: int | None = None
++    try:
++        tokenizer = load_tokenizer(tokenizer_model, trust_remote_code=True)
++        token_ids = tokenizer.encode("<|image_pad|>", add_special_tokens=False)
++        if len(token_ids) == 1:
++            token_id = int(token_ids[0])
++        else:
++            logger.warning("Image-token debug: no unique <|image_pad|> id from %s: %s", tokenizer_model, token_ids)
++    except Exception as exc:
++        logger.warning("Image-token debug: failed to load tokenizer from %s: %s", tokenizer_model, exc)
++
++    _IMAGE_PAD_TOKEN_ID_CACHE[tokenizer_model] = token_id
++    return token_id
++
++
++def _extract_image_debug_stats(
++    tokens: torch.Tensor,
++    mm_input_dict: dict[str, torch.Tensor] | None,
++    image_pad_token_id: int | None,
++) -> dict[str, int]:
++    """Count expected vs actual ``<|image_pad|>`` tokens for one packed sample.
++
++    ``expected`` is derived from ``image_grid_thw`` (t*h*w // spatial_merge_size**2,
++    i.e. //4 for Qwen3-VL); ``actual`` counts image-pad ids in the token stream.
++    A mismatch means the vision embeddings will be spliced into the wrong positions.
++    """
++    has_mm = int(mm_input_dict is not None)
++    num_images = 0
++    expected_visual_tokens = 0
++    if mm_input_dict is not None and mm_input_dict.get("image_grid_thw") is not None:
++        image_grid_thw = mm_input_dict["image_grid_thw"]
++        if image_grid_thw.ndim == 1:
++            image_grid_thw = image_grid_thw.view(1, -1)
++        if image_grid_thw.numel() > 0:
++            num_images = int(image_grid_thw.size(0))
++            expected_visual_tokens = int(
++                ((image_grid_thw[:, 0] * image_grid_thw[:, 1] * image_grid_thw[:, 2]) // 4).sum().item()
++            )
++
++    actual_image_pad_tokens = 0
++    if image_pad_token_id is not None:
++        actual_image_pad_tokens = int((tokens == image_pad_token_id).sum().item())
++
++    return {
++        "has_mm": has_mm,
++        "num_images": num_images,
++        "expected_visual_tokens": expected_visual_tokens,
++        "actual_image_pad_tokens": actual_image_pad_tokens,
++        "mm_missing_but_has_image_tokens": int(has_mm == 0 and actual_image_pad_tokens > 0),
++        "mm_present_but_count_mismatch": int(
++            has_mm == 1 and image_pad_token_id is not None and expected_visual_tokens != actual_image_pad_tokens
++        ),
++    }
++
++
++def log_megatron_image_token_debug(rollout_id: int, args: Namespace, rollout_data: RolloutBatch) -> None:
++    """Validate that packed ``<|image_pad|>`` token counts match ``image_grid_thw``.
++
++    Off by default; enable with ``log_megatron_image_token_debug: true`` in the browser
++    config. A nonzero broken/mismatch ratio means multimodal inputs are corrupted at the
++    training forward (vision embeds spliced at wrong positions) — a common cause of a VLM
++    RL run whose reward never trends. Logs at WARNING when any sample is broken, else INFO.
++    """
++    if not getattr(args, "log_megatron_image_token_debug", False):
++        return
++    if mpu.get_tensor_model_parallel_rank() != 0 or not mpu.is_pipeline_last_stage():
++        return
++
++    token_tensors = rollout_data.get("tokens", [])
++    if not token_tensors:
++        return
++    mm_inputs = rollout_data.get("multimodal_train_inputs") or [None] * len(token_tensors)
++    sample_indices = rollout_data.get("sample_indices")
++
++    image_pad_token_id = _get_image_pad_token_id(args)
++    stats = [
++        _extract_image_debug_stats(tokens, mm_input_dict, image_pad_token_id)
++        for tokens, mm_input_dict in zip(token_tensors, mm_inputs, strict=True)
++    ]
++    num_samples = len(stats)
++    mm_ratio = sum(s["has_mm"] for s in stats) / num_samples
++    image_token_ratio = sum(1 for s in stats if s["actual_image_pad_tokens"] > 0) / num_samples
++    broken_ratio = sum(s["mm_missing_but_has_image_tokens"] for s in stats) / num_samples
++    mismatch_ratio = sum(s["mm_present_but_count_mismatch"] for s in stats) / num_samples
++
++    first_problem = next(
++        (
++            sample_indices[i] if sample_indices is not None else i
++            for i, s in enumerate(stats)
++            if s["mm_missing_but_has_image_tokens"] or s["mm_present_but_count_mismatch"]
++        ),
++        None,
++    )
++
++    log_fn = logger.warning if (broken_ratio > 0 or mismatch_ratio > 0) else logger.info
++    log_fn(
++        "[MegatronImageTokenDebug] rollout=%s image_pad_id=%s samples=%s mm_ratio=%.3f "
++        "image_token_ratio=%.3f broken_ratio=%.3f mismatch_ratio=%.3f first_problem_sample=%s",
++        rollout_id,
++        image_pad_token_id,
++        num_samples,
++        mm_ratio,
++        image_token_ratio,
++        broken_ratio,
++        mismatch_ratio,
++        first_problem,
++    )
++
++
+ def log_rollout_data(
+     rollout_id: int,
+     args: Namespace,
+@@ -259,6 +381,7 @@ def log_rollout_data(
+     - Non-tensor lists are averaged elementwise.
+     - Scalars are converted to Python numbers.
+     """
++    log_megatron_image_token_debug(rollout_id, args, rollout_data)
+     if mpu.get_tensor_model_parallel_rank() == 0 and mpu.is_pipeline_last_stage():
+         cp_size = mpu.get_context_parallel_world_size()
+         log_dict = {}
+@@ -478,18 +601,30 @@ def log_passrate(rollout_id: int, args: Namespace, rollout_data: RolloutBatch) -
+ 
+     `raw_reward` is reshaped to `[group_number, group_size]`, then pass@k is
+     estimated per problem and averaged.
++
++    Browser-agent turn samples keep `raw_reward` at turn level and add
++    `trajectory_raw_reward` for one final-turn reward per trajectory. Use the
++    trajectory stream when available; otherwise fall back to `raw_reward`.
+     """
+     if mpu.get_tensor_model_parallel_rank() == 0 and mpu.is_pipeline_last_stage():
+-        log_dict = {}
+-        for key, val in rollout_data.items():
+-            if key != "raw_reward":
+-                continue
+-
+-            log_dict |= compute_pass_rate(
+-                flat_rewards=val,
+-                group_size=args.n_samples_per_prompt,
+-                num_groups=args.rollout_batch_size,
+-            )
++        # log_dict = {}
++        # for key, val in rollout_data.items():
++        #     if key != "raw_reward":
++        #         continue
++
++        #     log_dict |= compute_pass_rate(
++        #         flat_rewards=val,
++        #         group_size=args.n_samples_per_prompt,
++        #         num_groups=args.rollout_batch_size,
++        #     )
++        rewards = rollout_data.get("trajectory_raw_reward", rollout_data.get("raw_reward"))
++        if rewards is None:
++            return
++        log_dict = compute_pass_rate(
++            flat_rewards=rewards,
++            group_size=args.n_samples_per_prompt,
++            num_groups=args.rollout_batch_size,
++        )
+ 
+         gather_log_data("passrate", args, rollout_id, log_dict)
+ 
+diff --git a/slime/backends/megatron_utils/megatron_patch/__init__.py b/slime/backends/megatron_utils/megatron_patch/__init__.py
+index 8693ff85..f29a45c4 100644
+--- a/slime/backends/megatron_utils/megatron_patch/__init__.py
++++ b/slime/backends/megatron_utils/megatron_patch/__init__.py
+@@ -1 +1,2 @@
++from . import gdn_packed_seq_patch  # noqa: F401
+ from . import megatron_chunked_grad_coalesce_patch  # noqa: F401
+diff --git a/slime/backends/megatron_utils/megatron_patch/gdn_packed_seq_patch.py b/slime/backends/megatron_utils/megatron_patch/gdn_packed_seq_patch.py
+new file mode 100644
+index 00000000..dc0795ef
+--- /dev/null
++++ b/slime/backends/megatron_utils/megatron_patch/gdn_packed_seq_patch.py
+@@ -0,0 +1,164 @@
++# Patch megatron.core.ssm.gated_delta_net.GatedDeltaNet to support packed
++# (THD / variable-length) sequences during training.
++#
++# Stock Megatron raises `NotImplementedError("GDN does not support packed
++# sequence for now.")` whenever `packed_seq_params` is set. But the two FLA
++# primitives GDN already uses both accept a `cu_seqlens` argument that handles
++# variable-length packed input correctly (resetting the conv state and the
++# delta-rule recurrent state at each sequence boundary):
++#   - fla.modules.convolution.causal_conv1d(..., cu_seqlens=...)
++#   - fla.ops.gated_delta_rule.chunk_gated_delta_rule(..., cu_seqlens=...)
++#
++# slime already builds the correct `cu_seqlens` in the THD `PackedSeqParams`
++# (see slime/backends/megatron_utils/data.py). This patch threads that tensor
++# into the two FLA calls and removes the hard raise, without touching any
++# Megatron-LM file.
++#
++# Scope / assumptions:
++#   - Context parallelism is NOT supported in the packed path here (cp_size==1).
++#     With CP>1 GDN splits/all-to-alls the sequence across CP ranks, so the
++#     cu_seqlens<->token alignment would need extra handling that this patch
++#     does not implement. We assert rather than silently produce wrong grads.
++#   - deterministic_mode uses a plain F.conv1d (not FLA causal_conv1d) which
++#     cannot honor cu_seqlens, so conv state would bleed across packed
++#     sequence boundaries. We refuse the packed path in that mode.
++#   - Sequence parallel (SP) is fine: in_proj all-gathers the sequence before
++#     the conv/recurrence, so cu_seqlens (full-sequence boundaries) line up.
++
++import contextvars
++import logging
++import warnings
++
++logger = logging.getLogger(__name__)
++
++# Holds the cu_seqlens for the GDN forward currently executing in this process.
++# Set by the patched forward, read by the wrapped FLA primitives. None outside
++# a packed forward, in which case the wrappers behave exactly like the originals.
++_CU_SEQLENS = contextvars.ContextVar("slime_gdn_cu_seqlens", default=None)
++
++
++def _inject_cu_seqlens(fn):
++    """Wrap an FLA primitive so it picks up cu_seqlens from the context var
++    unless the caller already passed one explicitly."""
++
++    def wrapped(*args, **kwargs):
++        if kwargs.get("cu_seqlens") is None:
++            cu = _CU_SEQLENS.get()
++            if cu is not None:
++                kwargs["cu_seqlens"] = cu
++        return fn(*args, **kwargs)
++
++    return wrapped
++
++
++try:
++    from megatron.core.ssm import gated_delta_net as _gdn
++
++    if not getattr(_gdn, "_slime_packed_seq_patched", False):
++        if not getattr(_gdn, "HAVE_FLA", False):
++            # GDN itself raises on construction without FLA, so this patch is
++            # only meaningful when FLA is present.
++            raise ImportError("FLA not available; GDN packed-seq patch skipped.")
++
++        # Wrap the module-level FLA primitives. `causal_conv1d` is looked up as a
++        # module global inside forward(), so patching the module attribute is
++        # enough for it. The delta-rule fns are bound onto the instance in
++        # __init__ (self.gated_delta_rule = ...); we re-bind in patched __init__
++        # below so already/late-constructed instances both get the wrapper.
++        _gdn.causal_conv1d = _inject_cu_seqlens(_gdn.causal_conv1d)
++        _wrapped_chunk = _inject_cu_seqlens(_gdn.chunk_gated_delta_rule)
++        _wrapped_torch_chunk = _inject_cu_seqlens(_gdn.torch_chunk_gated_delta_rule)
++        _gdn.chunk_gated_delta_rule = _wrapped_chunk
++        _gdn.torch_chunk_gated_delta_rule = _wrapped_torch_chunk
++
++        GatedDeltaNet = _gdn.GatedDeltaNet
++        _orig_init = GatedDeltaNet.__init__
++        _orig_forward = GatedDeltaNet.forward
++
++        def _patched_init(self, *args, **kwargs):
++            _orig_init(self, *args, **kwargs)
++            # Re-bind to the cu_seqlens-injecting wrapper regardless of which
++            # backend __init__ picked (deterministic torch vs triton).
++            if self.config.deterministic_mode:
++                self.gated_delta_rule = _wrapped_torch_chunk
++            else:
++                self.gated_delta_rule = _wrapped_chunk
++
++        def _patched_forward(
++            self,
++            hidden_states,
++            attention_mask,
++            inference_context=None,
++            packed_seq_params=None,
++            sequence_len_offset=None,
++            *,
++            inference_params=None,
++            **kwargs,
++        ):
++            if packed_seq_params is None:
++                return _orig_forward(
++                    self,
++                    hidden_states,
++                    attention_mask,
++                    inference_context=inference_context,
++                    packed_seq_params=None,
++                    sequence_len_offset=sequence_len_offset,
++                    inference_params=inference_params,
++                    **kwargs,
++                )
++
++            # Packed / THD path.
++            assert self.cp_size == 1, (
++                "Packed-sequence GDN training is only supported with "
++                f"context-parallel-size == 1 (got cp_size={self.cp_size}). "
++                "Disable CP or use --qkv-format bshd for GDN models under CP."
++            )
++            assert not self.config.deterministic_mode, (
++                "Packed-sequence GDN training is incompatible with "
++                "deterministic_mode: the deterministic conv1d path cannot reset "
++                "state at sequence boundaries. Disable deterministic_mode or use "
++                "--qkv-format bshd."
++            )
++
++            cu_seqlens = packed_seq_params.cu_seqlens_q
++            # FLA varlen kernels expect int32 cu_seqlens; slime builds them as
++            # torch.int already, but be defensive.
++            if cu_seqlens.dtype != _gdn.torch.int32:
++                cu_seqlens = cu_seqlens.to(_gdn.torch.int32)
++
++            token = _CU_SEQLENS.set(cu_seqlens)
++            try:
++                # Pass packed_seq_params=None so the original body does not hit
++                # the hard raise; the wrapped FLA primitives pick up cu_seqlens
++                # from the context var instead.
++                return _orig_forward(
++                    self,
++                    hidden_states,
++                    attention_mask,
++                    inference_context=inference_context,
++                    packed_seq_params=None,
++                    sequence_len_offset=sequence_len_offset,
++                    inference_params=inference_params,
++                    **kwargs,
++                )
++            finally:
++                _CU_SEQLENS.reset(token)
++
++        GatedDeltaNet.__init__ = _patched_init
++        GatedDeltaNet.forward = _patched_forward
++        _gdn._slime_packed_seq_patched = True
++
++        logger.info(
++            "slime GDN packed-sequence patch applied to "
++            "megatron.core.ssm.gated_delta_net.GatedDeltaNet "
++            "(cu_seqlens threaded into FLA conv1d + gated_delta_rule)."
++        )
++
++except ImportError as exc:
++    warnings.warn(
++        f"slime GDN packed-sequence patch not applied ({exc!r}). "
++        "Training a GDN/linear-attention model with --qkv-format thd will hit "
++        "Megatron's 'GDN does not support packed sequence' error; use "
++        "--qkv-format bshd as a fallback.",
++        stacklevel=2,
++    )
+diff --git a/slime/backends/megatron_utils/model.py b/slime/backends/megatron_utils/model.py
+index 1ad6cd79..1fd2b3e3 100644
+--- a/slime/backends/megatron_utils/model.py
++++ b/slime/backends/megatron_utils/model.py
+@@ -709,6 +709,7 @@ def train(
+     data_iterator: Sequence[DataIterator],
+     num_microbatches: Sequence[int],
+     global_batch_sizes: Sequence[int],
++    ppo_epoch_id: int = 0,
+ ) -> None:
+     """Run training over a rollout consisting of multiple steps.
+ 
+@@ -870,7 +871,14 @@ def train(
+             and mpu.get_tensor_model_parallel_rank() == 0
+             and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1
+         ):
+-            accumulated_step_id = rollout_id * num_steps_per_rollout + step_id
++            # Include the PPO epoch so --ppo-epochs > 1 doesn't log both epochs to the same
++            # train/step (which collides in wandb). With ppo_epochs == 1 this reduces to the
++            # original rollout_id * num_steps_per_rollout + step_id.
++            accumulated_step_id = (
++                rollout_id * args.ppo_epochs * num_steps_per_rollout
++                + ppo_epoch_id * num_steps_per_rollout
++                + step_id
++            )
+             role = getattr(model[0], "role", "actor")
+             role_tag = "" if role == "actor" else f"{role}-"
+             log_dict = {
+@@ -878,6 +886,8 @@ def train(
+                 for key, val in loss_dict.items()
+             }
+             log_dict[f"train/{role_tag}grad_norm"] = grad_norm
++            if args.ppo_epochs > 1:
++                log_dict[f"train/{role_tag}ppo_epoch"] = ppo_epoch_id
+             if args.enable_mtp_training:
+                 log_dict[f"train/{role_tag}mtp_loss"] = mtp_losses
+ 
+diff --git a/slime/ray/rollout.py b/slime/ray/rollout.py
+index be8f4243..ff46802c 100644
+--- a/slime/ray/rollout.py
++++ b/slime/ray/rollout.py
+@@ -102,6 +102,113 @@ def _tensorize_rollout_data_for_training(rollout_data: dict[str, Any]) -> None:
+             dtype=torch.float32,
+         )
+ 
++def _has_turn_metadata(sample: Sample) -> bool:
++    metadata = sample.metadata or {}
++    return "turn_index" in metadata or "is_last_turn" in metadata
++
++
++def _turn_index(sample: Sample) -> int | None:
++    metadata = sample.metadata or {}
++    if "turn_index" not in metadata:
++        return None
++    try:
++        return int(metadata["turn_index"])
++    except (TypeError, ValueError):
++        return None
++
++
++def _trajectory_metric_sample_indices(samples: list[Sample], rollout_ids: list[int] | None = None) -> list[int]:
++    """Return one metric representative per turn-level trajectory.
++
++    Browser-agent rollouts can flatten one browser episode into many trainable turn samples.
++    Those sibling turns share one rollout id, so trajectory-level eval metrics should count
++    only the final turn for that episode. Ordinary non-turn samples are returned unchanged.
++    """
++    if not samples:
++        return []
++
++    groups: dict[Any, list[int]] = {}
++    rollout_order = []
++    for i, sample in enumerate(samples):
++        # Prefer the resolved rollout id from training data when available.
++        # Eval samples use Sample.rollout_id, falling back to Sample.index for the default one-sample-per-rollout path.
++        if rollout_ids is not None:
++            rid = rollout_ids[i]
++        elif sample.rollout_id is not None:
++            rid = sample.rollout_id
++        elif sample.index is not None:
++            rid = sample.index
++        else:
++            rid = i
++
++        if rid not in groups:
++            groups[rid] = []
++            rollout_order.append(rid)
++        groups[rid].append(i)
++
++    indices = []
++    for rid in rollout_order:
++        group_indices = groups[rid]
++        # Shared rollout_id alone is not enough to collapse a group: other compact rollout functions may
++        # emit multiple non-turn samples.
++        # Only browser-style turn metadata enables one-representative selection.
++        if not any(_has_turn_metadata(samples[i]) for i in group_indices):
++            indices.extend(group_indices)
++            continue
++
++        def selection_key(pos: int) -> tuple[bool, bool, int, int]:
++            turn_index = _turn_index(samples[pos])
++            return (
++                bool((samples[pos].metadata or {}).get("is_last_turn")),
++                turn_index is not None,
++                turn_index if turn_index is not None else -1,
++                pos,
++            )
++
++        # Selection priority: explicit is_last_turn, then largest turn_index,
++        # then latest flattened position as a defensive fallback.
++        indices.append(max(group_indices, key=selection_key))
++
++    return indices
++
++
++def _post_process_turn_level_rewards(args: Any, samples: list[Sample], raw_rewards: list[float]) -> list[float] | None:
++    """Normalize trajectory rewards by prompt group and broadcast them to turn samples.
++
++    Browser-agent rollout flattens one trajectory into several turn-level samples.
++    GRPO reward normalization should still happen over the n-samples-per-prompt trajectories
++    from the same prompt group, not over all turn rows.
++    Browser reward is propagated to every turn, so any turn can represent its trajectory for normalization.
++    """
++    if not samples or not all(_has_turn_metadata(sample) for sample in samples):
++        return None
++
++    grouped: dict[Any, dict[Any, list[int]]] = {}
++    for pos, sample in enumerate(samples):
++        group_key = sample.group_index
++        rollout_key = sample.rollout_id if sample.rollout_id is not None else sample.index
++        if rollout_key is None:
++            rollout_key = pos
++
++        if group_key not in grouped:
++            grouped[group_key] = {}
++        if rollout_key not in grouped[group_key]:
++            grouped[group_key][rollout_key] = []
++        grouped[group_key][rollout_key].append(pos)
++
++    normalized = [0.0] * len(samples)
++    for rollouts in grouped.values():
++        rewards = torch.tensor([raw_rewards[positions[0]] for positions in rollouts.values()], dtype=torch.float)
++        rewards = rewards - rewards.mean(dim=-1, keepdim=True)
++        if args.advantage_estimator in ["grpo", "gspo", "cispo"] and args.grpo_std_normalization:
++            rewards = rewards / (rewards.std(dim=-1, keepdim=True) + 1e-6)
++
++        for positions, reward in zip(rollouts.values(), rewards.tolist(), strict=True):
++            for pos in positions:
++                normalized[pos] = reward
++
++    return normalized
++
+ 
+ @dataclasses.dataclass
+ class ServerGroup:
+@@ -671,6 +778,9 @@ class RolloutManager:
+             self.args.advantage_estimator in ["grpo", "gspo", "cispo", "reinforce_plus_plus_baseline"]
+             and self.args.rewards_normalization
+         ):
++            if (turn_level_rewards := _post_process_turn_level_rewards(self.args, samples, raw_rewards)) is not None:
++                return raw_rewards, turn_level_rewards
++
+             # group norm
+             rewards = torch.tensor(raw_rewards, dtype=torch.float)
+             if rewards.shape[-1] == self.args.n_samples_per_prompt * self.args.rollout_batch_size:
+@@ -764,13 +874,32 @@ class RolloutManager:
+                 for sample in samples
+             ]
+ 
++        if any(_has_turn_metadata(sample) for sample in samples):
++            trajectory_indices = _trajectory_metric_sample_indices(samples, rollout_ids=rollout_ids)
++            train_data["trajectory_raw_reward"] = [train_data["raw_reward"][i] for i in trajectory_indices]
++
+         # For rollout buffer
+         if samples[0].metadata and "round_number" in samples[0].metadata:
+             train_data["round_number"] = [sample.metadata["round_number"] for sample in samples]
+ 
+         # Add rollout log probabilities for off-policy correction
+-        if samples[0].rollout_log_probs is not None:
+-            train_data["rollout_log_probs"] = [sample.rollout_log_probs for sample in samples]
++        # if samples[0].rollout_log_probs is not None:
++        #     train_data["rollout_log_probs"] = [sample.rollout_log_probs for sample in samples]
++
++        # Check allsamples: aborted / removed turn-level trajectories may carry
++        # rollout_log_probs=None even when trainable siblings have logprobs.
++        if any(sample.rollout_log_probs is not None for sample in samples):
++            rollout_log_probs = []
++            for sample in samples:
++                if sample.rollout_log_probs is not None:
++                    rollout_log_probs.append(sample.rollout_log_probs)
++                else:
++                    assert not self.args.use_rollout_logprobs or sample.remove_sample or sum(sample.loss_mask) == 0, (
++                        "Sample has no rollout_log_probs but is trainable (not removed/masked) while "
++                        "--use-rollout-logprobs is set; every trainable sample must carry rollout logprobs."
++                    )
++                    rollout_log_probs.append([0.0] * sample.response_length)
++            train_data["rollout_log_probs"] = rollout_log_probs
+ 
+         if getattr(self.args, "rollout_top_p", 1.0) != 1.0:
+             for sample in samples:
+@@ -860,7 +989,8 @@ class RolloutManager:
+                     continue
+                 rollout_data[key] = [data[key][j] for j in partition]
+             # keys that need to be splited at train side
+-            for key in ["raw_reward", "total_lengths"]:
++            # for key in ["raw_reward", "total_lengths"]:
++            for key in ["raw_reward", "trajectory_raw_reward", "total_lengths"]:
+                 if key not in data:
+                     continue
+                 rollout_data[key] = data[key]
+@@ -1247,8 +1377,10 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
+     log_dict = extra_metrics or {}
+     for key in data.keys():
+         rewards = data[key]["rewards"]
++        samples = data[key].get("samples")
+         log_dict[f"eval/{key}"] = sum(rewards) / len(rewards)
+-        if (samples := data[key].get("samples")) is not None:
++        # if (samples := data[key].get("samples")) is not None:
++        if samples is not None:
+             log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), f"eval/{key}/")
+         if "truncated" in data[key]:
+             truncated = data[key]["truncated"]
+@@ -1262,6 +1394,20 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
+                 f"eval/{key}-",
+             )
+ 
++        if samples is not None and any(_has_turn_metadata(sample) for sample in samples):
++            trajectory_indices = _trajectory_metric_sample_indices(samples)
++            trajectory_rewards = [rewards[i] for i in trajectory_indices]
++            trajectory_rewards_no_aborted = [
++                rewards[i] for i in trajectory_indices if samples[i].status != Sample.Status.ABORTED
++            ]
++
++            log_dict[f"eval/trajectory_{key}"] = sum(trajectory_rewards) / len(trajectory_rewards)
++            log_dict[f"eval/trajectory_{key}_no_aborted"] = (
++                sum(trajectory_rewards_no_aborted) / len(trajectory_rewards_no_aborted)
++                if trajectory_rewards_no_aborted
++                else 0.0
++            )
++
+     logger.info(f"eval {rollout_id}: {log_dict}")
+ 
+     step = compute_rollout_step(args, rollout_id)
+@@ -1295,6 +1441,7 @@ def compute_metrics_from_samples(args, samples):
+     log_dict = {}
+     log_dict |= dict_add_prefix(compute_statistics(response_lengths), "response_len/")
+     log_dict |= _compute_zero_std_metrics(args, samples)
++    log_dict |= _compute_judge_reward_metrics(samples)
+     log_dict |= _compute_spec_metrics(args, samples)
+     log_dict |= _compute_prefix_cache_metrics(args, samples)
+     log_dict |= _compute_reward_cat_metrics(args, samples)
+@@ -1407,6 +1554,54 @@ def _compute_zero_std_metrics(args, all_samples: list[Sample]):
+     return {f"zero_std/count_{reward}": len(items) for reward, items in group_by(interesting_rewards).items()}
+ 
+ 
++def _compute_judge_reward_metrics(all_samples: list[Sample]):
++    if not all_samples:
++        return {}
++
++    sample_indices = (
++        _trajectory_metric_sample_indices(all_samples)
++        if any(_has_turn_metadata(sample) for sample in all_samples)
++        else range(len(all_samples))
++    )
++
++    reward_metas = []
++    for i in sample_indices:
++        reward_meta = (all_samples[i].metadata or {}).get("reward")
++        if not isinstance(reward_meta, dict):
++            continue
++        if any(
++            key in reward_meta
++            for key in ("judge_required", "judge_api_called", "judge_error_type", "judge_timeout")
++        ):
++            reward_metas.append(reward_meta)
++
++    if not reward_metas:
++        return {}
++
++    required_count = sum(bool(meta.get("judge_required")) for meta in reward_metas)
++    api_called_count = sum(bool(meta.get("judge_api_called")) for meta in reward_metas)
++    timeout_count = sum(bool(meta.get("judge_timeout")) for meta in reward_metas)
++    error_types = [meta["judge_error_type"] for meta in reward_metas if meta.get("judge_error_type")]
++    error_count = len(error_types)
++
++    metrics = {
++        "judge/count": len(reward_metas),
++        "judge/required_count": required_count,
++        "judge/api_called_count": api_called_count,
++        "judge/error_count": error_count,
++        "judge/error_rate": error_count / required_count if required_count else 0.0,
++        "judge/api_error_rate": error_count / api_called_count if api_called_count else 0.0,
++        "judge/timeout_count": timeout_count,
++        "judge/timeout_rate": timeout_count / required_count if required_count else 0.0,
++    }
++
++    for error_type, items in group_by(error_types).items():
++        metrics[f"judge/error_type/{error_type}"] = len(items)
++        metrics[f"judge/error_type/{error_type}_rate"] = len(items) / required_count if required_count else 0.0
++
++    return metrics
++
++
+ def _compute_top_p_kept_vocab_metrics(args, all_samples: list[Sample]):
+     total_kept = 0
+     total_tokens = 0
+diff --git a/slime/rollout/data_source.py b/slime/rollout/data_source.py
+index ca7171ec..173ec04c 100644
+--- a/slime/rollout/data_source.py
++++ b/slime/rollout/data_source.py
+@@ -1,12 +1,22 @@
+ import abc
+ import copy
++import json
+ import logging
+ import os
++import random
+ from pathlib import Path
++from urllib.parse import urlsplit
+ 
+ import torch
+ 
++from slime.rollout.query_selector import (
++    QueryStats,
++    extract_completed_trajectory_length,
++    extract_query_key,
++    extract_terminal_sample,
++)
+ from slime.utils.data import Dataset
++from slime.utils.logging_utils import append_progress_log
+ from slime.utils.misc import load_function
+ from slime.utils.processing_utils import load_processor, load_tokenizer
+ from slime.utils.types import Sample
+@@ -45,6 +55,10 @@ class DataSource(abc.ABC):
+         Length of the data source. May change when samples are added/fetched.
+         """
+ 
++    def update_from_rollout(self, samples: list[list[Sample]], rollout_id: int | None = None):
++        """Update data-source state using finished rollout groups (no-op by default)."""
++        return None
++
+ 
+ # TODO may further refactor data-loading part later
+ class RolloutDataSource(DataSource):
+@@ -58,6 +72,19 @@ class RolloutDataSource(DataSource):
+         # TODO remove this
+         self.metadata = {}
+ 
++        # --- adaptive query sampling state (opt-in via --enable-adaptive-query-sampling) ---
++        self._adaptive_rng = random.Random(getattr(args, "rollout_seed", 42))
++        self._adaptive_query_stats: dict[str, QueryStats] = {}
++        self._adaptive_select_step = 0
++        self._adaptive_global_completed_traj_count = 0
++        self._adaptive_global_completed_len_sum = 0.0
++        self._adaptive_last_rollout_id = -1
++        self._adaptive_last_update_status = "not_started"
++        self._adaptive_last_updated_queries = 0
++        self._adaptive_blacklist_hosts = self._load_adaptive_blacklist_hosts()
++        self._adaptive_blacklist_logged_empty = False
++        self._sequential_blacklist_logged_empty = False
++
+         if args.rollout_global_dataset and args.prompt_data is not None:
+             tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
+             processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
+@@ -87,20 +114,55 @@ class RolloutDataSource(DataSource):
+         else:
+             self.dataset = None
+ 
++    # ------------------------------------------------------------------
++    # Blacklist helpers
++    # ------------------------------------------------------------------
++    def _load_adaptive_blacklist_hosts(self) -> set[str]:
++        """Load an optional host blacklist used to skip queries during adaptive sampling."""
++        configured_path = getattr(self.args, "adaptive_query_blacklist_path", None)
++
++        if configured_path:
++            path = Path(configured_path)
++        else:
++            repo_root = Path(__file__).resolve().parents[2]
++            path = repo_root / "examples" / "browser" / "data" / "webgym_filtered_popular_blacklist_hosts.txt"
++
++        if not path.exists():
++            return set()
++
++        hosts = {
++            line.strip().lower()
++            for line in path.read_text(encoding="utf-8").splitlines()
++            if line.strip() and not line.lstrip().startswith("#")
++        }
++        if hosts:
++            logger.info("Loaded %d adaptive query blacklist host(s) from %s", len(hosts), path)
++        return hosts
++
++    def _extract_sample_host(self, sample: Sample) -> str:
++        metadata = sample.metadata or {}
++        start_url = metadata.get("start_url")
++        if not isinstance(start_url, str) or not start_url:
++            return ""
++        try:
++            return (urlsplit(start_url).hostname or "").lower()
++        except Exception:
++            return ""
++
++    def _is_blacklisted_query_sample(self, sample: Sample) -> bool:
++        if not self._adaptive_blacklist_hosts:
++            return False
++        host = self._extract_sample_host(sample)
++        return bool(host and host in self._adaptive_blacklist_hosts)
++
++    # ------------------------------------------------------------------
++    # Sampling
++    # ------------------------------------------------------------------
+     def get_samples(self, num_samples):
+-        # TODO further improve code
+-        if self.dataset is not None:
+-            if self.sample_offset + num_samples <= len(self.dataset):
+-                prompt_samples = self.dataset.samples[self.sample_offset : self.sample_offset + num_samples]
+-                self.sample_offset += num_samples
+-            else:
+-                prompt_samples = self.dataset.samples[self.sample_offset :]
+-                num_samples -= len(prompt_samples)
+-                self.epoch_id += 1
+-                if self.args.rollout_shuffle:
+-                    self.dataset.shuffle(self.epoch_id)
+-                prompt_samples += self.dataset.samples[:num_samples]
+-                self.sample_offset = num_samples
++        if self._use_adaptive_query_sampling():
++            prompt_samples = self._get_adaptive_prompt_samples(num_samples)
++        elif self.dataset is not None:
++            prompt_samples = self._get_sequential_prompt_samples(num_samples)
+         else:
+             prompt_samples = [Sample() for _ in range(num_samples)]
+ 
+@@ -120,6 +182,468 @@ class RolloutDataSource(DataSource):
+     def add_samples(self, samples: list[list[Sample]]):
+         raise RuntimeError(f"Cannot add samples to {self.__class__.__name__}. This is a read-only data source.")
+ 
++    def _use_adaptive_query_sampling(self) -> bool:
++        return bool(getattr(self.args, "enable_adaptive_query_sampling", False) and self.dataset is not None)
++
++    def _get_sequential_prompt_samples(self, num_samples: int) -> list[Sample]:
++        assert self.dataset is not None and len(self.dataset) > 0, "No dataset rows available for sequential sampling."
++
++        if not self._adaptive_blacklist_hosts:
++            if self.sample_offset + num_samples <= len(self.dataset):
++                prompt_samples = self.dataset.samples[self.sample_offset : self.sample_offset + num_samples]
++                self.sample_offset += num_samples
++                return prompt_samples
++
++            prompt_samples = self.dataset.samples[self.sample_offset :]
++            remaining = num_samples - len(prompt_samples)
++            self.epoch_id += 1
++            if self.args.rollout_shuffle:
++                self.dataset.shuffle(self.epoch_id)
++            prompt_samples += self.dataset.samples[:remaining]
++            self.sample_offset = remaining
++            return prompt_samples
++
++        prompt_samples: list[Sample] = []
++        visited_since_yield = 0
++        dataset_len = len(self.dataset)
++
++        while len(prompt_samples) < num_samples:
++            if visited_since_yield >= dataset_len:
++                if not self._sequential_blacklist_logged_empty:
++                    logger.warning(
++                        "Sequential sampling blacklist filtered out every dataset row; falling back to unfiltered sequential sampling."
++                    )
++                    self._sequential_blacklist_logged_empty = True
++                remaining = num_samples - len(prompt_samples)
++                if self.sample_offset + remaining <= dataset_len:
++                    prompt_samples.extend(self.dataset.samples[self.sample_offset : self.sample_offset + remaining])
++                    self.sample_offset += remaining
++                else:
++                    prompt_samples.extend(self.dataset.samples[self.sample_offset :])
++                    remaining = num_samples - len(prompt_samples)
++                    self.epoch_id += 1
++                    if self.args.rollout_shuffle:
++                        self.dataset.shuffle(self.epoch_id)
++                    prompt_samples.extend(self.dataset.samples[:remaining])
++                    self.sample_offset = remaining
++                break
++
++            if self.sample_offset >= dataset_len:
++                self.epoch_id += 1
++                if self.args.rollout_shuffle:
++                    self.dataset.shuffle(self.epoch_id)
++                self.sample_offset = 0
++
++            sample = self.dataset.samples[self.sample_offset]
++            self.sample_offset += 1
++            visited_since_yield += 1
++
++            if self._is_blacklisted_query_sample(sample):
++                continue
++
++            prompt_samples.append(sample)
++            visited_since_yield = 0
++
++        return prompt_samples
++
++    def _get_adaptive_prompt_samples(self, num_samples: int) -> list[Sample]:
++        prompt_samples = []
++        while len(prompt_samples) < num_samples:
++            idx = self._sample_adaptive_index()
++            prompt_sample = self.dataset.samples[idx]
++            prompt_samples.append(prompt_sample)
++            self._on_query_selected(prompt_sample)
++
++        return prompt_samples
++
++    def _sample_adaptive_index(self) -> int:
++        assert self.dataset is not None and len(self.dataset) > 0, "No dataset rows available for adaptive sampling."
++
++        candidate_indices = [
++            idx for idx in range(len(self.dataset)) if not self._is_blacklisted_query_sample(self.dataset.samples[idx])
++        ]
++        if not candidate_indices:
++            if not self._adaptive_blacklist_logged_empty:
++                logger.warning(
++                    "Adaptive query blacklist filtered out every dataset row; falling back to the full dataset."
++                )
++                self._adaptive_blacklist_logged_empty = True
++            candidate_indices = list(range(len(self.dataset)))
++
++        weights = [self._compute_adaptive_weight(idx) for idx in candidate_indices]
++        total_weight = sum(weights)
++        if total_weight <= 0:
++            return candidate_indices[self._adaptive_rng.randrange(len(candidate_indices))]
++
++        threshold = self._adaptive_rng.random() * total_weight
++        cumulative = 0.0
++        choice_pos = len(weights) - 1
++        for pos, weight in enumerate(weights):
++            cumulative += weight
++            if cumulative >= threshold:
++                choice_pos = pos
++                break
++
++        return candidate_indices[choice_pos]
++
++    def _compute_adaptive_weight(self, dataset_idx: int) -> float:
++        sample = self.dataset.samples[dataset_idx]
++        query_key = extract_query_key(sample)
++        stats = self._adaptive_query_stats.get(query_key, QueryStats())
++
++        sr_weight = self._compute_success_rate_bucket_weight(stats)
++        stale_bonus = self._compute_stale_bonus(stats)
++        length_bonus = self._compute_length_bonus(stats)
++        return max(sr_weight * stale_bonus * length_bonus, 1e-8)
++
++    def _get_success_rate_bucket_name(self, stats: QueryStats) -> str:
++        """Bucket a query by its success rate (matches _compute_success_rate_bucket_weight)."""
++        if stats.total_rewarded_samples < self.args.adaptive_query_warmup_samples:
++            return "warmup"
++        success_rate = stats.success_rate
++        if success_rate == 0.0:
++            return "all_fail"
++        if success_rate < 0.3:
++            return "low"
++        if success_rate < 0.7:
++            return "mid"
++        if success_rate < 1.0:
++            return "high"
++        return "all_success"
++
++    def _compute_success_rate_bucket_weight(self, stats: QueryStats) -> float:
++        if stats.total_rewarded_samples < self.args.adaptive_query_warmup_samples:
++            return 1.0
++
++        success_rate = stats.success_rate
++        if success_rate == 0.0:
++            return self.args.adaptive_query_weight_all_fail
++        if success_rate < 0.3:
++            return self.args.adaptive_query_weight_low
++        if success_rate < 0.7:
++            return self.args.adaptive_query_weight_mid
++        if success_rate < 1.0:
++            return self.args.adaptive_query_weight_high
++        return self.args.adaptive_query_weight_all_success
++
++    def _compute_stale_bonus(self, stats: QueryStats) -> float:
++        stale_cap = max(int(self.args.adaptive_query_stale_cap), 1)
++        if stats.last_selected_step is None:
++            stale_ratio = 1.0
++        else:
++            staleness = max(self._adaptive_select_step - stats.last_selected_step, 0)
++            stale_ratio = min(staleness / stale_cap, 1.0)
++        return 1.0 + self.args.adaptive_query_stale_alpha * stale_ratio
++
++    def _compute_length_bonus(self, stats: QueryStats) -> float:
++        if stats.completed_traj_count == 0 or self._adaptive_global_completed_traj_count == 0:
++            return 1.0
++
++        ramp_rollouts = max(int(self.args.adaptive_query_length_ramp_rollouts), 1)
++        progress = min(max(self._adaptive_last_rollout_id, 0) / ramp_rollouts, 1.0)
++        if progress <= 0:
++            return 1.0
++
++        confidence_k = max(float(self.args.adaptive_query_length_confidence_k), 1.0)
++        confidence = stats.completed_traj_count / (stats.completed_traj_count + confidence_k)
++        global_avg_completed_len = self._adaptive_global_completed_len_sum / self._adaptive_global_completed_traj_count
++        if global_avg_completed_len <= 0:
++            return 1.0
++
++        len_norm = stats.avg_completed_len / global_avg_completed_len
++        len_norm = min(max(len_norm, 0.5), self.args.adaptive_query_length_cap)
++        positive_excess = max(len_norm - 1.0, 0.0)
++        return 1.0 + progress * confidence * self.args.adaptive_query_length_alpha * positive_excess
++
++    def _on_query_selected(self, prompt_sample: Sample):
++        query_key = extract_query_key(prompt_sample)
++        stats = self._adaptive_query_stats.setdefault(query_key, QueryStats())
++        stats.selected_count += 1
++        stats.last_selected_step = self._adaptive_select_step
++        self._adaptive_select_step += 1
++
++    # ------------------------------------------------------------------
++    # Feedback / stats update
++    # ------------------------------------------------------------------
++    def _reward_to_binary_outcome(self, reward_value: float | int | None) -> int | None:
++        if reward_value is None:
++            return None
++        return 1 if float(reward_value) > 0.5 else 0
++
++    def _normalize_rollout_group(self, group: list[Sample] | list[list[Sample]]) -> list[list[Sample]]:
++        if not group:
++            return []
++        if isinstance(group[0], list):
++            return [trajectory for trajectory in group if trajectory]
++        return [group]  # type: ignore[list-item]
++
++    def update_from_rollout(self, samples: list[list[Sample]], rollout_id: int | None = None):
++        if not self._use_adaptive_query_sampling():
++            self._adaptive_last_update_status = "skipped"
++            self._adaptive_last_updated_queries = 0
++            line = (
++                f"[AdaptiveQuerySampling] rollout={rollout_id + 1 if rollout_id is not None else 'unknown'} "
++                f"skipped reason=disabled_or_no_dataset "
++                f"enabled={bool(getattr(self.args, 'enable_adaptive_query_sampling', False))} "
++                f"has_dataset={self.dataset is not None}"
++            )
++            logger.info(line)
++            append_progress_log(self.args, line)
++            return
++
++        if rollout_id is not None:
++            self._adaptive_last_rollout_id = rollout_id
++
++        logger.info(
++            "[AdaptiveQuerySampling] rollout_id=%s update_from_rollout_start groups=%d tracked_queries_before=%d",
++            rollout_id,
++            len(samples),
++            len(self._adaptive_query_stats),
++        )
++
++        updated_queries = set()
++        for group in samples:
++            if not group:
++                continue
++
++            trajectories = self._normalize_rollout_group(group)  # one query group = multiple sampled trajectories
++            if not trajectories:
++                continue
++
++            query_key = extract_query_key(trajectories[0][0])
++            stats = self._adaptive_query_stats.setdefault(query_key, QueryStats())
++            updated_queries.add(query_key)
++
++            for trajectory in trajectories:
++                terminal_sample = extract_terminal_sample(trajectory)
++                reward_value = (
++                    terminal_sample.get_reward_value(self.args) if terminal_sample.reward is not None else None
++                )
++                outcome = self._reward_to_binary_outcome(reward_value)
++                if outcome is None:
++                    continue
++                if outcome == 1:
++                    stats.success_count += 1
++                else:
++                    stats.fail_count += 1
++
++                terminal_outcome = outcome
++                if terminal_outcome is None:
++                    stats.invalid_traj_count += 1
++                elif terminal_outcome == 1:
++                    stats.success_traj_count += 1
++                else:
++                    stats.fail_traj_count += 1
++
++                completed_len = extract_completed_trajectory_length(trajectory)
++                if completed_len is None:
++                    continue
++
++                stats.completed_traj_count += 1
++                stats.completed_len_sum += completed_len
++                self._adaptive_global_completed_traj_count += 1
++                self._adaptive_global_completed_len_sum += completed_len
++
++                if terminal_outcome == 1:
++                    stats.completed_success_traj_count += 1
++                    stats.completed_success_len_sum += completed_len
++                elif terminal_outcome == 0:
++                    stats.completed_fail_traj_count += 1
++                    stats.completed_fail_len_sum += completed_len
++
++        if updated_queries:
++            global_avg_completed_len = (
++                self._adaptive_global_completed_len_sum / self._adaptive_global_completed_traj_count
++                if self._adaptive_global_completed_traj_count > 0
++                else 0.0
++            )
++            logger.info(
++                "[AdaptiveQuerySampling] rollout_id=%s updated_queries=%d tracked_queries=%d global_avg_completed_len=%.3f",
++                rollout_id,
++                len(updated_queries),
++                len(self._adaptive_query_stats),
++                global_avg_completed_len,
++            )
++            self._adaptive_last_update_status = "updated"
++            self._adaptive_last_updated_queries = len(updated_queries)
++            if rollout_id is not None:
++                summary_record = self._append_adaptive_query_summary_log(rollout_id)
++                if summary_record is not None:
++                    self._append_adaptive_query_progress_log(summary_record)
++        else:
++            self._adaptive_last_update_status = "no_updates"
++            self._adaptive_last_updated_queries = 0
++            line = (
++                f"[AdaptiveQuerySampling] rollout={rollout_id + 1 if rollout_id is not None else 'unknown'} "
++                "update_from_rollout_no_updates"
++            )
++            logger.info(line)
++            append_progress_log(self.args, line)
++
++    def get_adaptive_query_rollout_metrics(self) -> dict[str, float]:
++        enabled = int(bool(getattr(self.args, "enable_adaptive_query_sampling", False)))
++        active = int(self._use_adaptive_query_sampling())
++        tracked_queries = len(self._adaptive_query_stats)
++        global_avg_completed_len = (
++            self._adaptive_global_completed_len_sum / self._adaptive_global_completed_traj_count
++            if self._adaptive_global_completed_traj_count > 0
++            else 0.0
++        )
++
++        bucket_counts = {key: 0 for key in ["warmup", "all_fail", "low", "mid", "high", "all_success"]}
++        if active:
++            for _, stats in self._adaptive_query_stats.items():
++                bucket_counts[self._get_success_rate_bucket_name(stats)] += 1
++
++        return {
++            "rollout/adaptive_query_sampling/enabled": float(enabled),
++            "rollout/adaptive_query_sampling/active": float(active),
++            "rollout/adaptive_query_sampling/status_updated": float(self._adaptive_last_update_status == "updated"),
++            "rollout/adaptive_query_sampling/status_no_updates": float(
++                self._adaptive_last_update_status == "no_updates"
++            ),
++            "rollout/adaptive_query_sampling/status_skipped": float(self._adaptive_last_update_status == "skipped"),
++            "rollout/adaptive_query_sampling/tracked_queries": float(tracked_queries),
++            "rollout/adaptive_query_sampling/updated_queries": float(self._adaptive_last_updated_queries),
++            "rollout/adaptive_query_sampling/select_step": float(self._adaptive_select_step),
++            "rollout/adaptive_query_sampling/global_completed_traj_count": float(
++                self._adaptive_global_completed_traj_count
++            ),
++            "rollout/adaptive_query_sampling/global_avg_completed_len": float(global_avg_completed_len),
++            "rollout/adaptive_query_sampling/bucket_warmup": float(bucket_counts["warmup"]),
++            "rollout/adaptive_query_sampling/bucket_all_fail": float(bucket_counts["all_fail"]),
++            "rollout/adaptive_query_sampling/bucket_low": float(bucket_counts["low"]),
++            "rollout/adaptive_query_sampling/bucket_mid": float(bucket_counts["mid"]),
++            "rollout/adaptive_query_sampling/bucket_high": float(bucket_counts["high"]),
++            "rollout/adaptive_query_sampling/bucket_all_success": float(bucket_counts["all_success"]),
++        }
++
++    # ------------------------------------------------------------------
++    # Adaptive stat snapshots / progress logs
++    # ------------------------------------------------------------------
++    def _iter_adaptive_query_stat_records(self):
++        global_avg_completed_len = (
++            self._adaptive_global_completed_len_sum / self._adaptive_global_completed_traj_count
++            if self._adaptive_global_completed_traj_count > 0
++            else 0.0
++        )
++
++        items = sorted(
++            self._adaptive_query_stats.items(),
++            key=lambda item: (
++                -item[1].selected_count,
++                -(item[1].success_count + item[1].fail_count),
++                item[0],
++            ),
++        )
++        for query_key, stats in items:
++            yield {
++                "query_key": query_key,
++                "selected_count": stats.selected_count,
++                "last_selected_step": stats.last_selected_step,
++                "success_count": stats.success_count,
++                "fail_count": stats.fail_count,
++                "total_rewarded_samples": stats.total_rewarded_samples,
++                "success_rate": stats.success_rate,
++                "success_traj_count": stats.success_traj_count,
++                "fail_traj_count": stats.fail_traj_count,
++                "invalid_traj_count": stats.invalid_traj_count,
++                "completed_traj_count": stats.completed_traj_count,
++                "completed_len_sum": stats.completed_len_sum,
++                "avg_completed_len": stats.avg_completed_len,
++                "completed_success_traj_count": stats.completed_success_traj_count,
++                "completed_success_len_sum": stats.completed_success_len_sum,
++                "avg_completed_success_len": stats.avg_completed_success_len,
++                "completed_fail_traj_count": stats.completed_fail_traj_count,
++                "completed_fail_len_sum": stats.completed_fail_len_sum,
++                "avg_completed_fail_len": stats.avg_completed_fail_len,
++                "global_avg_completed_len": global_avg_completed_len,
++            }
++
++    def _build_adaptive_query_summary_record(self, rollout_id: int, records: list[dict]) -> dict:
++        tracked_queries = len(records)
++        global_avg_completed_len = (
++            self._adaptive_global_completed_len_sum / self._adaptive_global_completed_traj_count
++            if self._adaptive_global_completed_traj_count > 0
++            else 0.0
++        )
++        bucket_counts = {"warmup": 0, "all_fail": 0, "low": 0, "mid": 0, "high": 0, "all_success": 0}
++        for stats in self._adaptive_query_stats.values():
++            bucket_counts[self._get_success_rate_bucket_name(stats)] += 1
++
++        top_queries = [
++            {
++                "query_key": record["query_key"],
++                "selected_count": record["selected_count"],
++                "success_rate": record["success_rate"],
++                "avg_completed_len": record["avg_completed_len"],
++            }
++            for record in records[:10]
++        ]
++        return {
++            "rollout_id": rollout_id,
++            "tracked_queries": tracked_queries,
++            "select_step": self._adaptive_select_step,
++            "global_completed_traj_count": self._adaptive_global_completed_traj_count,
++            "global_completed_len_sum": self._adaptive_global_completed_len_sum,
++            "global_avg_completed_len": global_avg_completed_len,
++            "bucket_counts": bucket_counts,
++            "top_queries": top_queries,
++        }
++
++    def _append_adaptive_query_summary_log(self, rollout_id: int) -> dict | None:
++        if not self._use_adaptive_query_sampling():
++            return None
++
++        save_dir = getattr(self.args, "save", None)
++        if not save_dir:
++            return None
++
++        base_dir = Path(save_dir) / "rollout" / "adaptive_query_sampling"
++        base_dir.mkdir(parents=True, exist_ok=True)
++
++        records = list(self._iter_adaptive_query_stat_records())
++        summary_record = self._build_adaptive_query_summary_record(rollout_id, records)
++        summary_path = base_dir / "summary.jsonl"
++        with summary_path.open("a", encoding="utf-8") as f:
++            f.write(json.dumps(summary_record, ensure_ascii=False, sort_keys=True) + "\n")
++
++        return summary_record
++
++    def _save_adaptive_query_detail_snapshot(self, rollout_id: int) -> None:
++        if not self._use_adaptive_query_sampling():
++            return
++
++        save_dir = getattr(self.args, "save", None)
++        if not save_dir:
++            return
++
++        base_dir = Path(save_dir) / "rollout" / "adaptive_query_sampling"
++        base_dir.mkdir(parents=True, exist_ok=True)
++
++        detail_path = base_dir / f"query_stats_{rollout_id}.jsonl"
++        with detail_path.open("w", encoding="utf-8") as f:
++            for record in self._iter_adaptive_query_stat_records():
++                f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
++
++    def _append_adaptive_query_progress_log(self, summary_record: dict) -> None:
++        bucket_counts = summary_record["bucket_counts"]
++        line = (
++            f"[AdaptiveQuerySampling] rollout={summary_record['rollout_id'] + 1} "
++            f"tracked_queries={summary_record['tracked_queries']} "
++            f"select_step={summary_record['select_step']} "
++            f"completed_trajs={summary_record['global_completed_traj_count']} "
++            f"global_avg_completed_len={summary_record['global_avg_completed_len']:.3f} "
++            f"buckets=warmup:{bucket_counts['warmup']},all_fail:{bucket_counts['all_fail']},"
++            f"low:{bucket_counts['low']},mid:{bucket_counts['mid']},high:{bucket_counts['high']},"
++            f"all_success:{bucket_counts['all_success']}"
++        )
++        logger.info(line)
++        append_progress_log(self.args, line)
++
++    # ------------------------------------------------------------------
++    # Checkpointing
++    # ------------------------------------------------------------------
+     def save(self, rollout_id):
+         if not self.args.rollout_global_dataset:
+             return
+@@ -131,9 +655,20 @@ class RolloutDataSource(DataSource):
+             "sample_index": self.sample_index,
+             "metadata": self.metadata,
+         }
++        if self._use_adaptive_query_sampling():
++            state_dict["adaptive_query_sampling"] = {
++                "query_stats": {key: stats.to_dict() for key, stats in self._adaptive_query_stats.items()},
++                "select_step": self._adaptive_select_step,
++                "global_completed_traj_count": self._adaptive_global_completed_traj_count,
++                "global_completed_len_sum": self._adaptive_global_completed_len_sum,
++                "last_rollout_id": self._adaptive_last_rollout_id,
++                "rng_state": self._adaptive_rng.getstate(),
++            }
+         path = os.path.join(self.args.save, f"rollout/global_dataset_state_dict_{rollout_id}.pt")
+         os.makedirs(os.path.dirname(path), exist_ok=True)
+         torch.save(state_dict, path)
++        if self._use_adaptive_query_sampling():
++            self._save_adaptive_query_detail_snapshot(rollout_id)
+ 
+     def load(self, rollout_id=None):
+         if not self.args.rollout_global_dataset:
+@@ -159,6 +694,19 @@ class RolloutDataSource(DataSource):
+         if self.args.rollout_global_dataset and self.args.rollout_shuffle and self.dataset is not None:
+             self.dataset.shuffle(self.epoch_id)
+ 
++        if self._use_adaptive_query_sampling():
++            adaptive_state = state_dict.get("adaptive_query_sampling", {})
++            self._adaptive_query_stats = {
++                key: QueryStats.from_dict(value) for key, value in adaptive_state.get("query_stats", {}).items()
++            }
++            self._adaptive_select_step = adaptive_state.get("select_step", 0)
++            self._adaptive_global_completed_traj_count = adaptive_state.get("global_completed_traj_count", 0)
++            self._adaptive_global_completed_len_sum = adaptive_state.get("global_completed_len_sum", 0.0)
++            self._adaptive_last_rollout_id = adaptive_state.get("last_rollout_id", -1)
++            rng_state = adaptive_state.get("rng_state")
++            if rng_state is not None:
++                self._adaptive_rng.setstate(rng_state)
++
+     def __len__(self) -> int:
+         if self.dataset is None:
+             return 0
+diff --git a/slime/rollout/query_selector.py b/slime/rollout/query_selector.py
+new file mode 100644
+index 00000000..3b4ea63e
+--- /dev/null
++++ b/slime/rollout/query_selector.py
+@@ -0,0 +1,101 @@
++import hashlib
++import json
++from dataclasses import asdict, dataclass
++from typing import Any
++
++from slime.utils.types import Sample
++
++
++@dataclass
++class QueryStats:
++    selected_count: int = 0
++    last_selected_step: int | None = None
++    success_count: int = 0
++    fail_count: int = 0
++    success_traj_count: int = 0
++    fail_traj_count: int = 0
++    invalid_traj_count: int = 0
++    completed_traj_count: int = 0
++    completed_len_sum: float = 0.0
++    completed_success_traj_count: int = 0
++    completed_success_len_sum: float = 0.0
++    completed_fail_traj_count: int = 0
++    completed_fail_len_sum: float = 0.0
++
++    @property
++    def total_rewarded_samples(self) -> int:
++        return self.success_count + self.fail_count
++
++    @property
++    def success_rate(self) -> float:
++        total = self.total_rewarded_samples
++        return self.success_count / total if total > 0 else 0.0
++
++    @property
++    def avg_completed_len(self) -> float:
++        return self.completed_len_sum / self.completed_traj_count if self.completed_traj_count > 0 else 0.0
++
++    @property
++    def avg_completed_success_len(self) -> float:
++        return (
++            self.completed_success_len_sum / self.completed_success_traj_count
++            if self.completed_success_traj_count > 0
++            else 0.0
++        )
++
++    @property
++    def avg_completed_fail_len(self) -> float:
++        return (
++            self.completed_fail_len_sum / self.completed_fail_traj_count if self.completed_fail_traj_count > 0 else 0.0
++        )
++
++    def to_dict(self) -> dict[str, Any]:
++        return asdict(self)
++
++    @staticmethod
++    def from_dict(data: dict[str, Any]) -> "QueryStats":
++        return QueryStats(**data)
++
++
++def extract_query_key(sample: Sample) -> str:
++    metadata = sample.metadata or {}
++    task_id = metadata.get("task_id")
++    if task_id:
++        return str(task_id)
++
++    payload = {
++        "prompt": sample.prompt,
++        "label": sample.label,
++        "metadata": metadata,
++    }
++    serialized = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
++    digest = hashlib.md5(serialized.encode("utf-8")).hexdigest()
++    return f"prompt:{digest}"
++
++
++def extract_terminal_sample(group: list[Sample]) -> Sample:
++    last_turn_samples = [sample for sample in group if bool((sample.metadata or {}).get("is_last_turn", False))]
++    if last_turn_samples:
++        return max(last_turn_samples, key=lambda sample: int((sample.metadata or {}).get("turn_index", -1)))
++
++    turn_samples = [sample for sample in group if "turn_index" in (sample.metadata or {})]
++    if turn_samples:
++        return max(turn_samples, key=lambda sample: int((sample.metadata or {}).get("turn_index", -1)))
++
++    return group[-1]
++
++
++def extract_completed_trajectory_length(group: list[Sample]) -> int | None:
++    terminal_sample = extract_terminal_sample(group)
++    if terminal_sample.status != Sample.Status.COMPLETED:
++        return None
++
++    metadata = terminal_sample.metadata or {}
++    total_steps = metadata.get("total_steps")
++    if isinstance(total_steps, int) and total_steps > 0:
++        return total_steps
++
++    if isinstance(terminal_sample.response_length, int) and terminal_sample.response_length > 0:
++        return terminal_sample.response_length
++
++    return None
+diff --git a/slime/rollout/sglang_rollout.py b/slime/rollout/sglang_rollout.py
+index 9dcf5fce..ed9041d1 100644
+--- a/slime/rollout/sglang_rollout.py
++++ b/slime/rollout/sglang_rollout.py
+@@ -402,6 +402,13 @@ async def generate_rollout_async(
+     target_data_size = args.rollout_batch_size
+ 
+     data = []
++    # Only accumulate every generated group (kept + filtered) when a consumer needs them
++    # (a process path, or adaptive query sampling which updates per-query stats from all
++    # groups). Otherwise all_data would retain the screenshots of every dropped group and
++    # can balloon to TBs under heavy over-sampling (OOM postmortem).
++    keep_all_samples = args.rollout_all_samples_process_path is not None or getattr(
++        args, "enable_adaptive_query_sampling", False
++    )
+     all_data = []
+     do_print = True
+     pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc="Rollout generation")
+@@ -424,7 +431,8 @@ async def generate_rollout_async(
+                 do_print = False
+ 
+             assert len(group) == args.n_samples_per_prompt
+-            all_data.append(group)
++            if keep_all_samples:
++                all_data.append(group)
+ 
+             dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group)
+             if not dynamic_filter_output.keep:
+@@ -449,9 +457,9 @@ async def generate_rollout_async(
+ 
+     assert len(data) == args.rollout_batch_size, f"Got {len(data)} samples, expected {args.rollout_batch_size}"
+     data = sorted(data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index)
+-    all_samples = sorted(
+-        all_data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index
+-    )
++    # all_samples = sorted(
++    #     all_data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index
++    # )
+ 
+     # reset the global state to prevent effects on the next rollout or eval.
+     state.reset()
+@@ -459,12 +467,17 @@ async def generate_rollout_async(
+         filter_func = load_function(args.rollout_sample_filter_path)
+         filter_func(args, data)
+ 
++    # all_data is only populated when keep_all_samples (a process path or adaptive query
++    # sampling), so this is empty and cheap otherwise.
++    all_samples = sorted(
++        all_data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index
++    )
+     # There can be circumstances where users want to process all samples including filtered ones.
+     if args.rollout_all_samples_process_path is not None:
+         process_func = load_function(args.rollout_all_samples_process_path)
+         process_func(args, all_samples, data_source)
+ 
+-    return RolloutFnTrainOutput(samples=data, metrics=metric_gatherer.collect()), aborted_samples
++    return RolloutFnTrainOutput(samples=data, metrics=metric_gatherer.collect()), aborted_samples, all_samples
+ 
+ 
+ EVAL_PROMPT_DATASET = {}
+@@ -633,7 +646,13 @@ def generate_rollout(
+         output, _ = run(eval_rollout(args, rollout_id))
+         return output
+ 
+-    output, aborted_samples = run(generate_rollout_async(args, rollout_id, data_source.get_samples))
++    output, aborted_samples, all_samples = run(generate_rollout_async(args, rollout_id, data_source.get_samples))
+     if aborted_samples:
+         data_source.add_samples(aborted_samples)
++    # Opt-in adaptive query sampling: feed all generated groups (kept + filtered) back to the
++    # data source to update per-query stats, and surface its metrics. No-op when disabled.
++    if getattr(args, "enable_adaptive_query_sampling", False):
++        data_source.update_from_rollout(all_samples, rollout_id=rollout_id)
++        if hasattr(data_source, "get_adaptive_query_rollout_metrics"):
++            output.metrics.update(data_source.get_adaptive_query_rollout_metrics())
+     return output
+diff --git a/slime/utils/arguments.py b/slime/utils/arguments.py
+index ccb121f3..743557fa 100644
+--- a/slime/utils/arguments.py
++++ b/slime/utils/arguments.py
+@@ -893,6 +893,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
+                 ),
+             )
+ 
++            parser.add_argument(
++                "--ppo-epochs",
++                type=int,
++                default=1,
++                help=(
++                    "Number of PPO optimization epochs over the same rollout data (default 1 = one pass). "
++                    ">1 reuses each rollout for more gradient updates; requires --use-rollout-logprobs so the "
++                    "importance-sampling ratio uses a fixed generation-time baseline across epochs."
++                ),
++            )
+             parser.add_argument("--eps-clip", type=float, default=0.2, help="PPO clip range")
+             parser.add_argument("--eps-clip-high", type=float, default=None, help="PPO clip upper range")
+             parser.add_argument(
+@@ -1442,6 +1452,42 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
+                     "can process all samples including filtered ones."
+                 ),
+             )
++            # --- Adaptive query sampling (opt-in) ---
++            # Weight fresh-query selection by per-query success-rate bucket x staleness x
++            # completed-length, so training focuses on queries that still carry learning
++            # signal. State lives in the RolloutDataSource; disabled by default.
++            parser.add_argument(
++                "--enable-adaptive-query-sampling",
++                action="store_true",
++                default=False,
++                help="Enable success-rate/staleness/length-weighted fresh-query selection in the data source.",
++            )
++            parser.add_argument(
++                "--adaptive-query-blacklist-path",
++                type=str,
++                default=None,
++                help=(
++                    "Optional host-blacklist file to skip queries during (adaptive or sequential) sampling. "
++                    "Defaults to examples/orchard_gui/data/webgym_filtered_popular_blacklist_hosts.txt if present."
++                ),
++            )
++            parser.add_argument(
++                "--adaptive-query-warmup-samples",
++                type=int,
++                default=10,
++                help="Number of rewarded samples before adaptive success-rate buckets start affecting a query.",
++            )
++            parser.add_argument("--adaptive-query-weight-all-fail", type=float, default=0.2)
++            parser.add_argument("--adaptive-query-weight-low", type=float, default=1.0)
++            parser.add_argument("--adaptive-query-weight-mid", type=float, default=1.4)
++            parser.add_argument("--adaptive-query-weight-high", type=float, default=0.7)
++            parser.add_argument("--adaptive-query-weight-all-success", type=float, default=0.2)
++            parser.add_argument("--adaptive-query-stale-cap", type=int, default=50)
++            parser.add_argument("--adaptive-query-stale-alpha", type=float, default=1.0)
++            parser.add_argument("--adaptive-query-length-alpha", type=float, default=0.3)
++            parser.add_argument("--adaptive-query-length-ramp-rollouts", type=int, default=30)
++            parser.add_argument("--adaptive-query-length-confidence-k", type=float, default=3.0)
++            parser.add_argument("--adaptive-query-length-cap", type=float, default=2.0)
+             return parser
+ 
+         def add_custom_megatron_plugins_arguments(parser):
+diff --git a/slime/utils/dp_schedule.py b/slime/utils/dp_schedule.py
+index 1735fad3..9f27fbdb 100644
+--- a/slime/utils/dp_schedule.py
++++ b/slime/utils/dp_schedule.py
+@@ -137,6 +137,12 @@ def build_dp_schedule(
+         f"num_rollouts ({len(rollout_ids)}) < global_batch_size ({global_batch_size}); "
+         f"need at least one rollout per step."
+     )
++    # Optimizer steps taken on this rollout's data. If this is 1, each rollout yields a
++    # single on-policy update (slow learning); lower --global-batch-size to raise it.
++    logger.info(
++        "[DPSchedule] optimizer_steps_per_rollout=%d (rollouts=%d, global_batch_size=%d)",
++        num_steps, len(rollout_ids), global_batch_size,
++    )
+ 
+     partitions: list[list[int]] = [[] for _ in range(dp_size)]
+     micro_batch_indices: list[list[list[int]]] = [[] for _ in range(dp_size)]
+diff --git a/slime/utils/logging_utils.py b/slime/utils/logging_utils.py
+index 1fc3d94b..f5454045 100644
+--- a/slime/utils/logging_utils.py
++++ b/slime/utils/logging_utils.py
+@@ -1,4 +1,5 @@
+ import logging
++from pathlib import Path
+ 
+ import wandb
+ 
+@@ -8,6 +9,24 @@ from .tensorboard_utils import _TensorboardAdapter
+ _LOGGER_CONFIGURED = False
+ 
+ 
++def append_progress_log(args, line: str, filename: str = "progress.log") -> None:
++    """Append a single human-readable progress line to ``<save>/progress.log``.
++
++    Best-effort: no-op when ``--save`` is unset, and never raises into the caller.
++    """
++    save_dir = getattr(args, "save", None)
++    if not save_dir:
++        return
++
++    path = Path(save_dir) / filename
++    try:
++        path.parent.mkdir(parents=True, exist_ok=True)
++        with path.open("a", encoding="utf-8") as f:
++            f.write(line.rstrip("\n") + "\n")
++    except Exception:
++        logging.getLogger(__name__).exception("Failed to append progress log to %s", path)
++
++
+ # ref: SGLang
+ def configure_logger(prefix: str = ""):
+     global _LOGGER_CONFIGURED
+diff --git a/tools/convert_torch_dist_to_hf_bridge.py b/tools/convert_torch_dist_to_hf_bridge.py
+index 798503f2..5a8cc6f7 100644
+--- a/tools/convert_torch_dist_to_hf_bridge.py
++++ b/tools/convert_torch_dist_to_hf_bridge.py
+@@ -1,5 +1,6 @@
+ import argparse
+ import os
++from dataclasses import dataclass
+ 
+ import megatron.bridge.training.model_load_save as _model_load_save_module
+ from megatron.bridge import AutoBridge
+@@ -7,6 +8,40 @@ from megatron.bridge import AutoBridge
+ from slime.utils.megatron_bridge_utils import patch_auto_bridge_hf_config
+ 
+ 
++@dataclass
++class _HybridPattern:
++    main_pattern: str
++    mtp_pattern: str | None
++    mtp_num_depths: int
++
++
++def _patch_mamba_hybrid_allocation_compat():
++    """Patch older Megatron-LM branches for newer Megatron Bridge imports."""
++    try:
++        from megatron.core.ssm import mamba_hybrid_layer_allocation as hybrid_allocation
++    except ImportError:
++        return
++
++    symbols = getattr(hybrid_allocation, "Symbols", None)
++    if symbols is not None and not hasattr(symbols, "MTP_SEPARATOR"):
++        symbols.MTP_SEPARATOR = "/"
++
++    if hasattr(hybrid_allocation, "parse_hybrid_pattern"):
++        return
++
++    def parse_hybrid_pattern(pattern: str) -> _HybridPattern:
++        sep = getattr(getattr(hybrid_allocation, "Symbols", object), "MTP_SEPARATOR", "/")
++        main_pattern, *mtp_patterns = pattern.split(sep)
++        mtp_pattern = mtp_patterns[0] if mtp_patterns else None
++        return _HybridPattern(
++            main_pattern=main_pattern,
++            mtp_pattern=mtp_pattern,
++            mtp_num_depths=len(mtp_patterns),
++        )
++
++    hybrid_allocation.parse_hybrid_pattern = parse_hybrid_pattern
++
++
+ # Here we need to patch Megatron Bridge's `load_model_config`, since the checkpoint is saved
+ # by Megatron and lack of provider information.
+ _provider_override = {}
+@@ -60,6 +95,7 @@ if __name__ == "__main__":
+     print(f"[convert] Using Bridge provider: {type(provider).__name__}")
+ 
+     print(f"Exporting checkpoint from {args.input_dir} to {args.output_dir}")
++    _patch_mamba_hybrid_allocation_compat()
+     bridge.export_ckpt(args.input_dir, args.output_dir)
+ 
+     print("Done!")

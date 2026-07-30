@@ -1,7 +1,7 @@
 # qwen3-235B-a22B
 NLAYERS=94
 FIRST_K_DENSE_REPLACE=0
-
+MODEL_ARGS_ROTARY_BASE=5000000
 arr=()
 for ((i=0; i<NLAYERS; i++)); do
   if (( i < FIRST_K_DENSE_REPLACE )); then

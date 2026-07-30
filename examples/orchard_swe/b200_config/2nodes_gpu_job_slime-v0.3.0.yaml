@@ -1,0 +1,212 @@
+apiVersion: batch.volcano.sh/v1alpha1
+kind: Job
+metadata:
+  generateName: orchard-swe-agent-2nodes-
+  namespace: bonete54
+spec:
+  queue: bonete54
+  minAvailable: 2        # total pods that must be ready (1 master + 1 worker)
+  plugins:
+    ssh: []              # enables passwordless SSH and hostfiles
+    svc: []              # headless Services for DNS between pods
+    env: []              # VC_* envs like VC_WORKER_HOSTS
+    pytorch: []          # sets MASTER_ADDR/PORT, WORLD_SIZE, RANK for DDP
+  tasks:
+    # ============================
+    # MASTER NODE
+    # ============================
+    - name: master
+      replicas: 1
+      policies:
+        - event: TaskCompleted
+          action: CompleteJob
+      template:
+        metadata:
+          labels:
+            app: orchard-swe-agent
+            role: master
+        spec:
+          schedulerName: volcano
+          restartPolicy: Never
+          securityContext:
+            seccompProfile:
+              type: Unconfined
+          volumes:
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 100Gi
+            - name: data
+              persistentVolumeClaim:
+                claimName: pvc-vast-bonete54
+          tolerations:
+            - key: "rdma"
+              operator: "Exists"
+              effect: "NoSchedule"
+            - key: "nvidia.com/gpu"
+              operator: "Exists"
+              effect: "NoSchedule"
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      app: orchard-swe-agent
+                      role: master
+                  topologyKey: kubernetes.io/hostname
+          containers:
+            - name: master
+              image: mirror.gcr.io/slimerl/slime:v0.3.0
+              imagePullPolicy: IfNotPresent
+              securityContext:
+                capabilities:
+                  add: ["SYS_PTRACE"]
+              volumeMounts:
+                - name: dshm
+                  mountPath: /dev/shm
+                - name: data
+                  mountPath: /data
+              ports:
+                - name: torch
+                  containerPort: 23456   # pytorch MASTER_PORT
+              env:
+                - name: NPROC_PER_NODE
+                  value: "8"
+                - name: OMP_NUM_THREADS
+                  value: "8"
+                - name: NCCL_DEBUG
+                  value: "INFO"
+                - name: NCCL_IB_DISABLE
+                  value: "0"
+                - name: PYTHONUNBUFFERED
+                  value: "1"
+              command: ["/bin/bash", "-lc"]
+              args:
+                - |
+                  set -eo pipefail
+                  export DEBIAN_FRONTEND=noninteractive
+                  apt-get update -y
+                  apt-get install -y screen jq
+                  apt-get install -y --no-install-recommends openssh-server openssh-client ca-certificates \
+                    ibverbs-utils rdmacm-utils perftest infiniband-diags
+                  mkdir -p /run/sshd && ssh-keygen -A
+                  /usr/sbin/sshd -D -e &
+                  echo "MASTER NODE STARTING"
+                  echo "MASTER_ADDR=$MASTER_ADDR"
+                  echo "WORLD_SIZE=$WORLD_SIZE"
+                  echo "RANK=$RANK"
+                  mv /root/slime /root/slime_backup
+                  ln -s /data/users/xxxx/workspace/orchard/trainer/slime /root/slime
+                  cd ~/slime/ && pip install -e . --no-deps
+                  pip install datasets==4.4.1 pyyaml==6.0.3 jinja2==3.1.6
+                  pip install mini-swe-agent==1.17.5
+                  pip install --force-reinstall --no-deps "nvidia-cutlass-dsl==4.5.1" "nvidia-cutlass-dsl-libs-base==4.5.1"
+                  pip install openai==2.6.1
+                  pip uninstall -y litellm
+                  cd /data/users/xxxx/workspace/SWE-bench-fork/ && pip install -e .
+                  cd /data/users/xxxx/workspace/orchard/orchard_env/ && pip install -e .
+                  apt-get install pssh -y
+                  export | grep HOSTS | bash /data/users/xxxx/workspace/orchard/trainer/slime/examples/orchard_swe/b200_config/gen_host.sh > ~/hostfile
+                  sleep 100d
+              resources:
+                requests:
+                  nvidia.com/gpu: "8"
+                  cpu: "104"
+                  memory: "2880Gi"
+                  rdma/rdma_shared_device_a: "8"
+                limits:
+                  nvidia.com/gpu: "8"
+                  cpu: "104"
+                  memory: "2880Gi"
+                  rdma/rdma_shared_device_a: "8"
+
+    - name: worker
+      replicas: 1          # Increase for more worker nodes
+      template:
+        metadata:
+          labels:
+            app: orchard-swe-agent
+            role: worker
+        spec:
+          schedulerName: volcano
+          restartPolicy: Never
+          securityContext:
+            seccompProfile:
+              type: Unconfined
+          volumes:
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 100Gi
+            - name: data
+              persistentVolumeClaim:
+                claimName: pvc-vast-bonete54
+          tolerations:
+            - key: "rdma"
+              operator: "Exists"
+              effect: "NoSchedule"
+            - key: "nvidia.com/gpu"
+              operator: "Exists"
+              effect: "NoSchedule"
+          containers:
+            - name: worker
+              image: mirror.gcr.io/slimerl/slime:v0.3.0
+              imagePullPolicy: IfNotPresent
+              securityContext:
+                capabilities:
+                  add: ["SYS_PTRACE"]
+              volumeMounts:
+                - name: dshm
+                  mountPath: /dev/shm
+                - name: data
+                  mountPath: /data
+              ports:
+                - name: torch
+                  containerPort: 23456
+              env:
+                - name: NPROC_PER_NODE
+                  value: "8"
+                - name: OMP_NUM_THREADS
+                  value: "8"
+                - name: NCCL_DEBUG
+                  value: "INFO"
+                - name: NCCL_IB_DISABLE
+                  value: "0"
+                - name: PYTHONUNBUFFERED
+                  value: "1"
+              command: ["/bin/bash", "-lc"]
+              args:
+                - |
+                  set -eo pipefail
+                  export DEBIAN_FRONTEND=noninteractive
+                  apt-get update -y
+                  apt-get install -y screen jq
+                  apt-get install -y --no-install-recommends openssh-server openssh-client ca-certificates \
+                    ibverbs-utils rdmacm-utils perftest infiniband-diags
+                  mkdir -p /run/sshd && ssh-keygen -A
+                  /usr/sbin/sshd -D -e &
+                  mv /root/slime /root/slime_backup
+                  ln -s /data/users/xxxx/workspace/orchard/trainer/slime /root/slime
+                  cd ~/slime/ && pip install -e . --no-deps
+                  pip install datasets==4.4.1 pyyaml==6.0.3 jinja2==3.1.6
+                  pip install mini-swe-agent==1.17.5
+                  pip install --force-reinstall --no-deps "nvidia-cutlass-dsl==4.5.1" "nvidia-cutlass-dsl-libs-base==4.5.1"
+                  pip install openai==2.6.1
+                  pip uninstall -y litellm
+                  cd /data/users/xxxx/workspace/SWE-bench-fork/ && pip install -e .
+                  cd /data/users/xxxx/workspace/orchard/orchard_env/ && pip install -e .
+                  apt-get install pssh -y
+                  sleep 100d
+              resources:
+                requests:
+                  nvidia.com/gpu: "8"
+                  cpu: "104"
+                  memory: "2880Gi"
+                  rdma/rdma_shared_device_a: "8"
+                limits:
+                  nvidia.com/gpu: "8"
+                  cpu: "104"
+                  memory: "2880Gi"
+                  rdma/rdma_shared_device_a: "8"
+
+    

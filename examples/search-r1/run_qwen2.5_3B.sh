@@ -113,8 +113,8 @@ MISC_ARGS=(
 )
 
 CUSTOM_ARGS=(
-   --custom-generate-function-path generate_with_search.generate
-   --custom-rm-path generate_with_search.reward_func
+   --custom-generate-function-path generate_with_search_qwen3.generate
+   --custom-rm-path generate_with_search_qwen3.reward_func
 
    # TIS-related args, recommended to enable when using TIS
    # --custom-config-path examples/train_infer_mismatch_helper/mis.yaml

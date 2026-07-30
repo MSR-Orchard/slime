@@ -208,6 +208,125 @@ def get_grpo_returns(
     return returns
 
 
+def _build_per_step_discount_from_mask(
+    full_mask: torch.Tensor,
+    reward: torch.Tensor | float,
+    gamma: float,
+) -> torch.Tensor:
+    """Build a per-token return tensor with per-agent-step discounting.
+
+    Each contiguous run of ``mask == 1`` tokens is treated as one agent
+    step. For a trajectory containing ``N`` such steps with terminal
+    reward ``R``, step ``k`` (0-indexed from the first step) receives
+    return ``gamma**(N - 1 - k) * R`` for every token belonging to it.
+    Tokens where ``mask == 0`` (observations / tool outputs) receive 0.
+
+    Args:
+        full_mask: 1-D tensor of 0/1 values over the full response.
+        reward: Scalar terminal reward for the trajectory.
+        gamma: Per-step discount factor in ``(0, 1]``.
+
+    Returns:
+        1-D tensor of the same shape as ``full_mask`` containing the
+        per-token return.
+    """
+    device = full_mask.device
+    dtype = torch.float32
+    returns = torch.zeros_like(full_mask, dtype=dtype, device=device)
+
+    mask_int = full_mask.to(torch.int64)
+    # Step boundaries: a token starts a new step if mask==1 and the
+    # previous token is mask==0 (or this is the first token).
+    prev = torch.cat([torch.zeros(1, dtype=torch.int64, device=device), mask_int[:-1]])
+    starts = ((mask_int == 1) & (prev == 0)).nonzero(as_tuple=True)[0].tolist()
+
+    if not starts:
+        return returns
+
+    # End indices (exclusive) for each step.
+    ends = []
+    for s in starts[1:]:
+        # walk back from s to find the last mask==1 index of the prior step
+        # but since prev==0 at s, the prior step ends at the last index
+        # before s where mask==1, which is simply s-1 walked back.
+        # Easier: scan forward from each start to find run end.
+        ends.append(s)
+    # final step end = position after the last mask==1
+    last_one = (mask_int == 1).nonzero(as_tuple=True)[0]
+    ends.append(int(last_one[-1].item()) + 1)
+
+    num_steps = len(starts)
+    reward_val = float(reward) if not torch.is_tensor(reward) else reward.item()
+    for k, (s, e) in enumerate(zip(starts, ends, strict=True)):
+        discount = gamma ** (num_steps - 1 - k)
+        # only assign to tokens where mask==1 within [s, e)
+        segment_mask = mask_int[s:e] == 1
+        returns[s:e][segment_mask] = reward_val * discount
+
+    return returns
+
+
+def get_grpo_per_step_returns(
+    rewards: torch.Tensor,
+    kl: list[torch.Tensor],
+    loss_masks: list[torch.Tensor],
+    response_lengths: list[int],
+    total_lengths: list[int],
+    gamma: float,
+) -> list[torch.Tensor]:
+    """GRPO returns with per-agent-step discounting.
+
+    Each contiguous run of ``loss_mask == 1`` tokens in a sample is one
+    "agent step" (one assistant turn). With ``N`` steps and terminal
+    reward ``R``, step ``k`` is assigned return ``gamma**(N-1-k) * R``.
+    The result tensor for each sample matches the shape of the
+    corresponding ``kl[i]`` (i.e. the local CP chunk).
+
+    Args:
+        rewards: Scalar terminal rewards, shape ``[B]``.
+        kl: Per-token KL tensors for the local CP chunk of each sample.
+        loss_masks: Full-response loss masks per sample (not CP-sliced).
+        response_lengths: Full response length per sample.
+        total_lengths: Full sequence length (prompt + response) per sample.
+        gamma: Per-step discount factor in ``(0, 1]``.
+
+    Returns:
+        List of return tensors with the same shape as ``kl[i]``.
+    """
+    from megatron.core import mpu
+
+    cp_size = mpu.get_context_parallel_world_size()
+
+    out: list[torch.Tensor] = []
+    for i in range(len(rewards)):
+        local_kl_chunk = kl[i]
+        total_len, response_len = total_lengths[i], response_lengths[i]
+
+        full_mask = loss_masks[i]
+        assert full_mask.numel() == response_len, (
+            f"loss_masks[{i}] length {full_mask.numel()} != response_lengths[{i}] {response_len}"
+        )
+
+        full_returns = _build_per_step_discount_from_mask(
+            full_mask=full_mask,
+            reward=rewards[i],
+            gamma=gamma,
+        )
+
+        if cp_size > 1:
+            from slime.backends.megatron_utils.cp_utils import slice_log_prob_with_cp
+
+            local_returns = slice_log_prob_with_cp(full_returns, total_len, response_len)
+        else:
+            local_returns = full_returns
+
+        # Make sure dtype/device match the local kl chunk.
+        local_returns = local_returns.to(dtype=local_kl_chunk.dtype, device=local_kl_chunk.device)
+        out.append(local_returns)
+
+    return out
+
+
 def get_reinforce_plus_plus_returns(
     rewards: torch.Tensor,
     kl: list[torch.Tensor],

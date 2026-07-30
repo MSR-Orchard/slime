@@ -427,6 +427,7 @@ def train_one_step(
     num_microbatches: int,
     step_global_batch_size: int,
     microbatch_pbar=None,
+    update_lr_scheduler: bool = True,
 ) -> tuple[dict[str, float], float]:
     """Execute a single pipeline-parallel training step.
 
@@ -585,8 +586,12 @@ def train_one_step(
 
         # Update learning rate. Use the per-step global_batch_size when dynamic
         # batching is on so the scheduler's samples-seen counter tracks reality.
+        # Under PPO epochs (ppo_epochs > 1) the same rollout is replayed, so the
+        # scheduler is advanced only on the first epoch to keep the LR schedule
+        # tied to rollout progress rather than the number of replay passes.
         assert update_successful
-        opt_param_scheduler.step(increment=step_global_batch_size)
+        if update_lr_scheduler:
+            opt_param_scheduler.step(increment=step_global_batch_size)
 
     # release grad
     for model_chunk in model:
@@ -717,8 +722,9 @@ def train(
         pre_hook_enabled = False
 
     num_steps_per_rollout = len(num_microbatches)
+    ppo_epochs = max(1, getattr(args, "ppo_epochs", 1) or 1)
     microbatch_pbar = tqdm(
-        total=sum(num_microbatches),
+        total=sum(num_microbatches) * ppo_epochs,
         desc=f"{getattr(model[0], 'role', 'actor')} train",
         unit="microbatch",
         dynamic_ncols=True,
@@ -726,8 +732,19 @@ def train(
         disable=_disable_tqdm_for_non_main_rank(),
     )
 
-    # Run training iterations till done.
-    for step_id in range(num_steps_per_rollout):
+    # Run training iterations till done. With PPO epochs (``ppo_epochs`` > 1) the
+    # SAME rollout batch is replayed ``ppo_epochs`` times: the data iterators are
+    # reset at each epoch boundary, and the LR scheduler is advanced only on the
+    # first epoch so the schedule tracks rollout progress rather than the number
+    # of replay passes. ``old_log_probs`` / advantages were computed once before
+    # ``train`` so each epoch's PPO importance ratio is taken against the fixed
+    # behavior policy -- exactly the PPO-epoch semantics.
+    for epoch_id, step_id in (
+        (e, s) for e in range(ppo_epochs) for s in range(num_steps_per_rollout)
+    ):
+        if step_id == 0 and epoch_id > 0:
+            for iterator in data_iterator:
+                iterator.reset()
 
         # Run training step.
         loss_dict, grad_norm = train_one_step(
@@ -741,9 +758,10 @@ def train(
             num_microbatches[step_id],
             global_batch_sizes[step_id],
             microbatch_pbar=microbatch_pbar,
+            update_lr_scheduler=(epoch_id == 0),
         )
 
-        if step_id == 0:
+        if epoch_id == 0 and step_id == 0:
             # Enable forward pre-hook after training step has successfully run. All subsequent
             # forward passes will use the forward pre-hook / `param_sync_func` in
             # `forward_backward_func`.
@@ -779,7 +797,11 @@ def train(
             and mpu.get_tensor_model_parallel_rank() == 0
             and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1
         ):
-            accumulated_step_id = rollout_id * num_steps_per_rollout + step_id
+            accumulated_step_id = (
+                rollout_id * num_steps_per_rollout * ppo_epochs
+                + epoch_id * num_steps_per_rollout
+                + step_id
+            )
             role = getattr(model[0], "role", "actor")
             role_tag = "" if role == "actor" else f"{role}-"
             log_dict = {
@@ -802,7 +824,7 @@ def train(
                 assert log_dict["train/train_rollout_logprob_abs_diff"] <= 0.1, f"{log_dict=}"
 
             if args.ci_test and not args.ci_disable_kl_checker:
-                if step_id == 0 and "train/ppo_kl" in log_dict and "train/pg_clipfrac" in log_dict:
+                if epoch_id == 0 and step_id == 0 and "train/ppo_kl" in log_dict and "train/pg_clipfrac" in log_dict:
                     # TODO: figure out why KL is not exactly zero when using PPO loss with KL clipping, and whether this is expected behavior or a bug.
                     assert log_dict["train/ppo_kl"] < 1e-8, f"{log_dict=}"
                 # R3 replays rollout routing for the actor path, while ref

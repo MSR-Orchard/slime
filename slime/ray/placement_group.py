@@ -127,12 +127,17 @@ def create_training_models(args, pgs, rollout_manager):
 
         actor_args = parse_megatron_role_args(args, args.megatron_config_path, role="actor")
 
-    actor_model = allocate_train_group(
-        args=actor_args,
-        num_nodes=args.actor_num_nodes,
-        num_gpus_per_node=args.actor_num_gpus_per_node,
-        pg=pgs["actor"],
-    )
+    # Critic-only training (--no-actor): skip creating/loading the actor entirely
+    # to save GPU memory. The actor is never trained, saved, or synced in this mode.
+    skip_actor = getattr(args, "no_actor", False)
+    actor_model = None
+    if not skip_actor:
+        actor_model = allocate_train_group(
+            args=actor_args,
+            num_nodes=args.actor_num_nodes,
+            num_gpus_per_node=args.actor_num_gpus_per_node,
+            pg=pgs["actor"],
+        )
 
     critic_model = None
     if args.use_critic:
@@ -155,14 +160,16 @@ def create_training_models(args, pgs, rollout_manager):
         )
         critic_start_rollout_ids = ray.get(critic_model.async_init(critic_model.args, role="critic", with_ref=False))
 
-    actor_start_rollout_ids = ray.get(
-        actor_model.async_init(
-            actor_args,
-            role="actor",
-            with_ref=actor_args.kl_coef != 0 or actor_args.use_kl_loss,
-            with_opd_teacher=actor_args.use_opd and actor_args.opd_type == "megatron",
+    actor_start_rollout_ids = None
+    if actor_model is not None:
+        actor_start_rollout_ids = ray.get(
+            actor_model.async_init(
+                actor_args,
+                role="actor",
+                with_ref=actor_args.kl_coef != 0 or actor_args.use_kl_loss,
+                with_opd_teacher=actor_args.use_opd and actor_args.opd_type == "megatron",
+            )
         )
-    )
     # TODO how to decide rollout start id when critic is involved? For now we just require user to specify it via args.
     if args.use_critic:
         start_rollout_ids = critic_start_rollout_ids
@@ -174,7 +181,8 @@ def create_training_models(args, pgs, rollout_manager):
     if args.start_rollout_id is None:
         args.start_rollout_id = start_rollout_ids[0]
 
-    actor_model.set_rollout_manager(rollout_manager)
+    if actor_model is not None:
+        actor_model.set_rollout_manager(rollout_manager)
     if args.use_critic:
         critic_model.set_rollout_manager(rollout_manager)
 

@@ -576,7 +576,9 @@ class RolloutManager:
         return ray.get([engine.check_weights.remote(action=action) for engine in self.rollout_engines])
 
     def _get_rollout_data(self, rollout_id):
+        logger.info(f"[ROLLOUT_DATA] Starting _get_rollout_data for rollout_id={rollout_id}")
         if self.args.load_debug_rollout_data:
+            logger.info(f"[ROLLOUT_DATA] Loading from debug rollout data")
             data = torch.load(
                 self.args.load_debug_rollout_data.format(rollout_id=rollout_id),
                 weights_only=False,
@@ -591,7 +593,9 @@ class RolloutManager:
                 )
             metrics = None
         else:
+            logger.info(f"[ROLLOUT_DATA] Calling generate_rollout function: {self.args.rollout_function_path}")
             data = call_rollout_fn(self.generate_rollout, self.args, rollout_id, self.data_source, evaluation=False)
+            logger.info(f"[ROLLOUT_DATA] generate_rollout returned, extracting metrics and samples")
             metrics = data.metrics
             data = data.samples
             # Enforce the group_id contract before flattening: any list[Sample]
@@ -602,6 +606,7 @@ class RolloutManager:
             # the group once instead of N times. Legacy rollout_id is accepted.
             _validate_group_id_annotated(data)
             # flatten the data if it is a list of lists
+            logger.info(f"[ROLLOUT_DATA] Flattening nested sample lists")
             while isinstance(data[0], list):
                 data = list(itertools.chain.from_iterable(data))
 
@@ -631,6 +636,17 @@ class RolloutManager:
             return self.custom_reward_post_process_func(self.args, samples)
 
         raw_rewards = [sample.get_reward_value(self.args) for sample in samples]
+
+        # Fix reference: https://github.com/THUDM/slime/pull/1245/changes/17c5f33c233b329858f5dc4aba54a8fe116bfae2
+        # Handle None rewards (e.g., from aborted/failed samples) by replacing with 0.0
+        none_count = sum(1 for r in raw_rewards if r is None)
+        if none_count > 0:
+            logger.warning(
+                f"Found {none_count} samples with None rewards (e.g., aborted/failed samples). "
+                "Replacing with 0.0 for tensor conversion."
+            )
+            raw_rewards = [r if r is not None else 0.0 for r in raw_rewards]
+
         if (
             self.args.advantage_estimator in ["grpo", "gspo", "reinforce_plus_plus_baseline"]
             and self.args.rewards_normalization
@@ -794,6 +810,7 @@ class RolloutManager:
                 "rollout_routed_experts",
                 "prompt",
                 "teacher_log_probs",
+                "teacher_valid_mask",
             ]:
                 if key not in data:
                     continue
@@ -1187,7 +1204,10 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
 
     log_dict = extra_metrics or {}
     for key in data.keys():
-        rewards = data[key]["rewards"]
+        rewards = [r for r in data[key]["rewards"] if r is not None]
+        if not rewards:
+            logger.warning(f"eval/{key}: all rewards are None, skipping")
+            continue
         log_dict[f"eval/{key}"] = sum(rewards) / len(rewards)
         if (samples := data[key].get("samples")) is not None:
             log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), f"eval/{key}/")
@@ -1239,6 +1259,7 @@ def compute_metrics_from_samples(args, samples):
     log_dict |= _compute_spec_metrics(args, samples)
     log_dict |= _compute_prefix_cache_metrics(args, samples)
     log_dict |= _compute_reward_cat_metrics(args, samples)
+    log_dict |= _compute_prm_metrics(samples)
     log_dict["repetition_frac"] = np.mean([int(has_repetition(s.response)) for s in samples]).item()
     log_dict["truncated_ratio"] = np.mean([int(s.status == Sample.Status.TRUNCATED) for s in samples]).item()
     return log_dict
@@ -1313,6 +1334,72 @@ def _compute_prefix_cache_metrics(args, all_samples: list[Sample]):
     metrics["prefix_cache_hit_rate"] = total_cached_tokens / total_prompt_tokens if total_prompt_tokens > 0 else 0.0
     metrics["avg_cached_tokens_per_sample"] = total_cached_tokens / num_samples
     return metrics
+
+
+def _compute_prm_metrics(all_samples: list[Sample]):
+    """Aggregate per-sample PRM metadata written by ``compute_simple_plus_llm_as_judges_reward``
+    into wandb-loggable metrics.  Returns ``{}`` when no sample carries ``metadata["prm"]``
+    (backward-compatible with reward modes that don't use the PRM path).
+    """
+    prm_data = [
+        s.metadata["prm"]
+        for s in all_samples
+        if s.metadata and isinstance(s.metadata.get("prm"), dict)
+    ]
+    if not prm_data:
+        return {}
+
+    n = len(prm_data)
+    # Samples where the API was actually attempted (alpha != 0)
+    called = [d for d in prm_data if d.get("called", False)]
+    # Successful responses: called, no error, process_reward > 0 or error == ""
+    success = [d for d in called if d.get("error", "error") == ""]
+    timeout = [d for d in called if d.get("error", "") == "timeout"]
+    error = [d for d in called if d.get("error", "") not in ("", "timeout") and d.get("error")]
+
+    metrics: dict = {}
+
+    # --- API request rates (denominator = all samples in batch) ---
+    metrics["api_called_rate"] = len(called) / n
+    metrics["api_success_rate"] = len(success) / n
+    metrics["api_timeout_rate"] = len(timeout) / n
+    metrics["api_error_rate"] = len(error) / n
+
+    # --- Base (outcome) reward over ALL attempted samples (judge-independent) ---
+    # ``base_binary_reward`` is computed before the judge call and stored for every
+    # called sample (success + timeout + error), so this mean does NOT drop the
+    # judge failures the way ``base_reward_mean`` (success-only) does. Denominator
+    # = number of called samples that recorded a base reward (~= len(called)).
+    base_all = [d["base_binary_reward"] for d in called if "base_binary_reward" in d]
+    if base_all:
+        metrics["base_reward_mean_all"] = float(np.mean(base_all))
+
+    if not success:
+        return dict_add_prefix(metrics, "prm/")
+
+    # --- Reward values (from successful calls only) ---
+    proc_rewards = [d["process_reward"] for d in success]
+    contributions = [d["contribution"] for d in success]
+    base_rewards = [d.get("base_binary_reward", 0.0) for d in success]
+
+    metrics["process_reward_mean"] = float(np.mean(proc_rewards))
+    metrics["process_reward_median"] = float(np.median(proc_rewards))
+    metrics["contribution_mean"] = float(np.mean(contributions))
+    metrics["base_reward_mean"] = float(np.mean(base_rewards))
+    metrics["alpha"] = float(success[0].get("alpha", 0.0))
+
+    # --- Per-rubric means (only for samples where the rubric was scored) ---
+    # Rubric ids are discovered from the data instead of hard-coded, so any
+    # rubric set the judge emits (e.g. R1..R7 from
+    # ``examples/orchard_swe/swe_prm.py::DIM_WEIGHTS``) is logged automatically.
+    score_dicts = [d["scores"] for d in success if isinstance(d.get("scores"), dict)]
+    rubric_ids = sorted({k for s in score_dicts for k in s})
+    for rubric in rubric_ids:
+        rubric_scores = [s[rubric] for s in score_dicts if rubric in s]
+        if rubric_scores:
+            metrics[f"{rubric}_mean"] = float(np.mean(rubric_scores))
+
+    return dict_add_prefix(metrics, "prm/")
 
 
 def _compute_reward_cat_metrics(args, all_samples: list[Sample]):

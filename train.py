@@ -1,9 +1,46 @@
+import logging
+import time
+
 import ray
 
 from slime.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger, finish_tracking, init_tracking, update_tracking_open_metrics
 from slime.utils.misc import should_run_periodic_action
+
+logger = logging.getLogger(__name__)
+
+
+def _start_heartbeat(interval: int = 100):
+    """Start a daemon thread that prints a heartbeat message every `interval` seconds.
+
+    This keeps the ray job submit log-streaming connection alive during long
+    rollout steps that produce no stdout output for extended periods.
+    """
+    import sys
+    import threading
+    from datetime import datetime
+
+    def _heartbeat():
+        while True:
+            threading.Event().wait(interval)
+            print(
+                f"[HEARTBEAT] {datetime.now().strftime('%Y-%m-%dT%H:%M:%S')} - training still running...",
+                flush=True,
+            )
+
+    t = threading.Thread(target=_heartbeat, daemon=True)
+    t.start()
+
+
+def _ray_get_with_progress(ref, description: str, interval: int = 60):
+    """Wait for a Ray object ref and emit periodic progress logs from the driver."""
+    start_time = time.time()
+    while True:
+        ready, _ = ray.wait([ref], timeout=interval)
+        if ready:
+            return ray.get(ready[0])
+        logger.info("%s still running (elapsed %.0fs)", description, time.time() - start_time)
 
 
 def train(args):
@@ -27,7 +64,8 @@ def train(args):
         ray.get(rollout_manager.onload_weights.remote())
 
     # Always push actor weights to rollout once weights are loaded.
-    actor_model.update_weights()
+    if actor_model is not None:
+        actor_model.update_weights()
 
     if args.check_weight_update_equal:
         ray.get(rollout_manager.check_weights.remote(action="compare"))
@@ -49,7 +87,9 @@ def train(args):
                 critic_model.clear_memory()
 
     def save(rollout_id):
-        actor_trains_this_step = (not args.use_critic) or rollout_id >= args.num_critic_only_steps
+        actor_trains_this_step = (
+            actor_model is not None and ((not args.use_critic) or rollout_id >= args.num_critic_only_steps)
+        )
         if actor_trains_this_step:
             actor_model.save_model(
                 rollout_id,
@@ -71,9 +111,11 @@ def train(args):
         rollout_data_ref = ray.get(rollout_manager.generate.remote(rollout_id))
 
         if args.offload_rollout:
-            ray.get(rollout_manager.offload.remote())
+            _ray_get_with_progress(rollout_manager.offload.remote(), f"offload(rollout_id={rollout_id})")
 
-        actor_trains_this_step = (not args.use_critic) or rollout_id >= args.num_critic_only_steps
+        actor_trains_this_step = (
+            actor_model is not None and ((not args.use_critic) or rollout_id >= args.num_critic_only_steps)
+        )
 
         if args.use_critic:
             value_refs = critic_model.async_train(rollout_id, rollout_data_ref)
@@ -90,7 +132,8 @@ def train(args):
         offload_train(actor_trains_this_step)
         if args.offload_rollout:
             ray.get(rollout_manager.onload_weights.remote())
-        actor_model.update_weights()
+        if actor_model is not None:
+            actor_model.update_weights()
 
         if args.offload_rollout:
             ray.get(rollout_manager.onload_kv.remote())

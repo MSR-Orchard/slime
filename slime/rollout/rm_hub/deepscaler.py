@@ -6,6 +6,10 @@ def get_deepscaler_rule_based_reward(response, label):
         model_solution = response.split("</think>")[-1]
     elif "###Response" in response:
         model_solution = response.split("###Response")[1]
+    elif '<|return|>' in response:
+        model_solution = response.split('<|return|>')[0]
+    elif '<|im_end|>' in response:
+        model_solution = response.split('<|im_end|>')[0]
     else:
         return 0
 

@@ -1,0 +1,57 @@
+# Environment mode: "local", "remote", "sandbox", or "browser-use"
+# - local:       create WebEnv directly (no server)
+# - remote:      connect to env_server via remote.server_url below
+# - sandbox:     create K8s sandbox pods via OrChard Env (orchestrator + exec/curl)
+# - browser-use: drive a remote browser hosted on cloud.browser-use.com via CDP
+mode: sandbox
+
+# Max number of envs created concurrently across ALL modes (process-wide).
+# Bounds the creation burst from a rollout batch so it doesn't overwhelm the backend.
+# <= 0 disables the limit.
+max_env_concurrency: -1
+
+# Sandbox-specific config (used when mode: sandbox).
+# A fresh sandbox is created for each generation and deleted on env.exit().
+# Connection settings can be overridden by env vars (SANDBOX_ORCHESTRATOR_URL, SANDBOX_API_KEY).
+sandbox:
+  orchestrator_url: ""          # SANDBOX_ORCHESTRATOR_URL
+  api_key: ""                   # SANDBOX_API_KEY
+  image: "mirror.gcr.io/qianhuiwu/orchard-gui-env:v0"  # container image for sandbox pods (Google's Docker Hub mirror, avoids docker.io pull rate limits)
+  cpu: "1"                      # CPU request/limit per sandbox
+  memory: "8Gi"                # memory request/limit per sandbox
+  block_network: false          # block network egress in sandbox
+  # Note: curl/exec retries are fixed in sandbox_env.py (_EXEC_CURL_MAX_RETRIES /
+  # _EXEC_CURL_RETRY_DELAY), not configurable here.
+
+# Browser-Use-specific config (used when mode: browser-use).
+# A fresh remote browser session is created per generation and stopped on env.exit().
+# API key can be overridden by the BROWSER_USE_API_KEY env var.
+browser_use:
+  api_key: ""                   # BROWSER_USE_API_KEY
+  timeout: 10                   # session timeout in minutes (free: ≤15, paid: ≤240)
+  profile_id: null              # optional Browser-Use profile id
+  proxy_country_code: null      # optional proxy country code (e.g. "us", "de")
+
+# Remote-specific config (used when mode: remote).
+# Connect to one or more pre-started env_server.py instances (see env/docker_server/).
+# Each server is single-env, so list several (comma-separated) to raise concurrency.
+remote:
+  server_url: ""                # e.g. "http://host:8100,http://host:8101"
+
+width: 1280
+height: 1000 # not applied for `browser-use` mode
+dpr: 1
+
+max_retries: 3
+wait_timeout: 60000
+
+# related to coordinate resizing
+resize_output_coords: true # if True, then resize_scale or patch_size will be used to resize the output coordinates
+resize_scale: 1000 # if int > 0: the predicted coordinates will be divided by this factor for normalization; if 0 or negative, will check `patch_size`
+image_patch_size: 32 # qwen3vl: 32; qwen25vl: 28. if resize_scale <= 0, will call smart_resize with this patch_size to resize the output coordinates
+
+path_to_policy: env/prompts/system_prompt.md
+path_to_tool_list: env/prompts/tool_list.json
+
+use_screenshot: true
+use_a11ytree: false

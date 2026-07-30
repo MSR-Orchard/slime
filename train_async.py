@@ -1,9 +1,14 @@
+import logging
+import time
+
 import ray
 
 from slime.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger, finish_tracking, init_tracking, update_tracking_open_metrics
 from slime.utils.misc import should_run_periodic_action
+
+logger = logging.getLogger(__name__)
 
 
 # The framework supports other asynchronous approaches such as fully async (which is shown in examples/full_async).
@@ -34,12 +39,20 @@ def train(args):
     # async train loop.
     rollout_data_next_future = rollout_manager.generate.remote(args.start_rollout_id)
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
+        if args.eval_interval is not None and rollout_id == 0 and not args.skip_eval_before_train:
+            ray.get(rollout_manager.eval.remote(rollout_id))
+
         # Sync the last generation
         if rollout_data_next_future is not None:
+            logger.info(f"[ASYNC_TRAIN] rollout_id={rollout_id}: Waiting for rollout data (ray.get)...")
+            t0 = time.time()
             rollout_data_curr_ref = ray.get(rollout_data_next_future)
+            logger.info(f"[ASYNC_TRAIN] rollout_id={rollout_id}: Got rollout data in {time.time()-t0:.2f}s, "
+                        f"dp_shards={len(rollout_data_curr_ref)}")
 
         # Start the next rollout early.
         if rollout_id + 1 < args.num_rollout:
+            logger.info(f"[ASYNC_TRAIN] rollout_id={rollout_id}: Submitting next rollout (rollout_id={rollout_id+1})")
             rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)
 
         if args.use_critic:
@@ -50,7 +63,10 @@ def train(args):
             else:
                 ray.get(value_refs)
         else:
+            logger.info(f"[ASYNC_TRAIN] rollout_id={rollout_id}: Starting actor training...")
+            t0 = time.time()
             ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref))
+            logger.info(f"[ASYNC_TRAIN] rollout_id={rollout_id}: Actor training done in {time.time()-t0:.2f}s")
 
         if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
             if (not args.use_critic) or rollout_id >= args.num_critic_only_steps:
@@ -68,9 +84,14 @@ def train(args):
 
         if (rollout_id + 1) % args.update_weights_interval == 0:
             # sync generate before update weights to prevent update weight in the middle of generation
+            logger.info(f"[ASYNC_TRAIN] rollout_id={rollout_id}: Syncing rollout before weight update...")
+            t0 = time.time()
             rollout_data_curr_ref = ray.get(x) if (x := rollout_data_next_future) is not None else None
+            logger.info(f"[ASYNC_TRAIN] rollout_id={rollout_id}: Rollout synced in {time.time()-t0:.2f}s, updating weights...")
             rollout_data_next_future = None
+            t0 = time.time()
             actor_model.update_weights()
+            logger.info(f"[ASYNC_TRAIN] rollout_id={rollout_id}: Weight update done in {time.time()-t0:.2f}s")
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
             ray.get(rollout_manager.eval.remote(rollout_id))

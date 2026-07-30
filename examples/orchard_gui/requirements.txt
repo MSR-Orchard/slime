@@ -1,0 +1,6 @@
+qwen_vl_utils
+playwright
+timeout-decorator
+loguru
+browser-use-sdk
+

@@ -145,11 +145,19 @@ class MegatronTrainRayActor(TrainRayActor):
             update_weight_cls = UpdateWeightFromDistributedDelta
         else:
             update_weight_cls = UpdateWeightFromDistributed
+        resolved_model_name = (
+            type(self.hf_config).__name__.lower() if self.args.model_name is None else self.args.model_name
+        )
+        if is_megatron_main_rank():
+            logger.info(
+                f"[WEIGHT_SYNC] converter dispatch model_name={resolved_model_name!r} "
+                f"(hf_config class={type(self.hf_config).__name__}, --model-name={self.args.model_name})"
+            )
         self.weight_updater = update_weight_cls(
             self.args,
             self.model,
             weights_getter=lambda: self.weights_backuper.get("actor"),
-            model_name=type(self.hf_config).__name__.lower() if self.args.model_name is None else self.args.model_name,
+            model_name=resolved_model_name,
             quantization_config=getattr(self.hf_config, "quantization_config", None),
         )
 
@@ -395,6 +403,7 @@ class MegatronTrainRayActor(TrainRayActor):
             self.wake_up()
 
         with timer("data_preprocess"):
+            logger.info(f"[TRAIN_ACTOR] rank={dist.get_rank()} rollout_id={rollout_id}: Getting rollout data...")
             rollout_data = self._get_rollout_data(rollout_data_ref)
 
         if self.role == "critic":
@@ -451,7 +460,9 @@ class MegatronTrainRayActor(TrainRayActor):
                 if "ref" in self.weights_backuper.backup_tags:
                     if self.args.use_routing_replay:
                         os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
+                    logger.info(f"[TRAIN_ACTOR] rank={dist.get_rank()} rollout_id={rollout_id}: Switching to ref model...")
                     self._switch_model("ref")
+                    logger.info(f"[TRAIN_ACTOR] rank={dist.get_rank()} rollout_id={rollout_id}: Computing ref log_probs...")
                     rollout_data.update(
                         self.compute_log_prob(
                             data_iterator,
@@ -494,6 +505,7 @@ class MegatronTrainRayActor(TrainRayActor):
                             os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
                         else:
                             os.environ["ROUTING_REPLAY_STAGE"] = "record"
+                    logger.info(f"[TRAIN_ACTOR] rank={dist.get_rank()} rollout_id={rollout_id}: Computing actor log_probs...")
                     rollout_data.update(
                         self.compute_log_prob(
                             data_iterator,
@@ -501,6 +513,7 @@ class MegatronTrainRayActor(TrainRayActor):
                             store_prefix="",
                         )
                     )
+                    logger.info(f"[TRAIN_ACTOR] rank={dist.get_rank()} rollout_id={rollout_id}: Actor log_probs done")
                     if self.args.use_rollout_routing_replay:
                         RoutingReplay.clear_all_forward()
 
@@ -516,7 +529,9 @@ class MegatronTrainRayActor(TrainRayActor):
 
                 # Calculate adv and returns. Need to performed before training (instead of on the fly),
                 # because we may need normalize the whole rollout.
+                logger.info(f"[TRAIN_ACTOR] rank={dist.get_rank()} rollout_id={rollout_id}: Computing advantages...")
                 compute_advantages_and_returns(self.args, rollout_data)
+                logger.info(f"[TRAIN_ACTOR] rank={dist.get_rank()} rollout_id={rollout_id}: Advantages computed")
 
             if self.rollout_data_postprocess is not None:
                 self.rollout_data_postprocess(self.args, rollout_id, rollout_data)
@@ -530,6 +545,7 @@ class MegatronTrainRayActor(TrainRayActor):
             # Train
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
+            logger.info(f"[TRAIN_ACTOR] rank={dist.get_rank()} rollout_id={rollout_id}: Starting forward/backward pass...")
             with timer("actor_train"):
                 train(
                     rollout_id,
@@ -540,6 +556,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     num_microbatches,
                     global_batch_sizes,
                 )
+            logger.info(f"[TRAIN_ACTOR] rank={dist.get_rank()} rollout_id={rollout_id}: Forward/backward pass done")
 
             self.prof.step(rollout_id=rollout_id)
 

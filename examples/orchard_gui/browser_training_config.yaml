@@ -1,0 +1,59 @@
+# Additional training config for browser environment.
+# These values are accessible on the `args` object inside generate_browser.py
+# and reward_browser.py via getattr(args, ...).
+
+# Maximum total tokens (prompt + response) per trajectory before truncating.
+# Browser trajectories can be long - set this to your GPU memory budget.
+rollout_max_context_len: 32768
+
+# abort if model fails to produce valid tool calls N times in a row
+max_consecutive_parse_failures: 3
+
+# max steps per episode (trajectory). Note: an episode can end early due to success/failure conditions, but will be truncated if it exceeds this limit.
+max_steps: 30
+
+## Timeouts (seconds) — per-await guards in generate_browser.py.
+# On timeout the sample is cleanly ABORTED instead of hanging.
+env_init_timeout: 300    # sandbox create + reset
+inference_timeout: 300   # one SGLang /generate
+env_step_timeout: 120    # one browser action (~20s normal)
+env_exit_timeout: 60     # sandbox teardown
+
+# Overall wall-clock cap for one rollout, a safety net on top of the per-await
+# timeouts above (a multi-turn rollout can otherwise run for max_steps × those
+# limits before any single await trips). Empty/absent = disabled. On timeout the
+# rollout is cancelled, the env is torn down via the shielded _safe_exit_env, and
+# a cleanly ABORTED sample (removed from the loss) is returned.
+rollout_task_timeout_secs: 1200  # e.g. 1800
+
+# VLM debug: validate that packed <|image_pad|> token counts match image_grid_thw at
+# the training forward. Off by default; turn on to catch multimodal-input corruption
+# (a common cause of a VLM RL run whose reward never trends). Logs [MegatronImageTokenDebug].
+log_megatron_image_token_debug: true
+
+## Context Management
+context_num_screenshots: 1
+include_tool_response: true
+include_history_thoughts: true
+
+# save the generated samples. Empty string to disable saving.
+path_to_save_generated_samples: # qwen3vl_235b
+
+# Custom eval logging: also log format_reward and judge_reward as separate wandb charts.
+# custom_eval_rollout_log_function_path: examples.orchard_gui.eval_log_browser.eval_log_func
+
+## Reward shaping
+# Reward for a trajectory that aborted on repeated malformed tool calls
+# (terminate_reason=consecutive_parse_failures). Following OpenWebRL, -1.0 penalizes
+# unparseable output more than an honest task failure (combined reward is -1/0/1); the
+# wider spread gives GRPO a stronger push away from garbage output. Set 0.0 to disable.
+format_failure_penalty: -1.0
+
+## LLM as a Judge
+judge_max_attached_imgs: 3 # for turn-level reward: min(context_num_screenshots, judge_max_attached_imgs)
+judge_api_mode: "api_key" # choice of ["api_key", "served", "token"].
+judge_api_model: "gpt-4.1"
+judge_prompt_variant: "action_history"
+judge_timeout_secs: 120.0
+log_judge_output: false    # log full judge output during reward computation
+debug_trace_prob: 0.0      # probability of saving a debug trace for a sample

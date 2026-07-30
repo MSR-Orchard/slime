@@ -1,6 +1,8 @@
 from argparse import Namespace
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from typing import Any
+import warnings
 
 import torch
 import torch.distributed as dist
@@ -17,6 +19,7 @@ from slime.utils.ppo_utils import (
     compute_opsm_mask,
     compute_policy_loss,
     get_advantages_and_returns_batch,
+    get_grpo_per_step_returns,
     get_grpo_returns,
     get_reinforce_plus_plus_baseline_advantages,
     get_reinforce_plus_plus_returns,
@@ -530,22 +533,49 @@ def get_values(
     return torch.empty((0,), device=logits.device), res
 
 
+def _k1_reward(student_log_probs: torch.Tensor, teacher_log_probs: torch.Tensor) -> torch.Tensor:
+    return teacher_log_probs - student_log_probs
+
+
+def _js_skew_reward(student_log_probs: torch.Tensor, teacher_log_probs: torch.Tensor, lam: float = 0.5) -> torch.Tensor:
+    ratio = (teacher_log_probs - student_log_probs).exp().clamp(min=1e-6, max=100)
+    u = lam * ratio + (1 - lam)
+    log_u = u.log()
+    return -log_u
+
+
 def apply_opd_kl_to_advantages(
     args: Namespace,
     rollout_data: RolloutBatch,
     advantages: list[torch.Tensor],
     student_log_probs: list[torch.Tensor] | None,
+    reward_type: str = "k1",
 ) -> None:
-    """Apply on-policy distillation KL penalty to advantages.
+    """Apply an on-policy distillation reward to advantages.
 
-    Computes reverse KL (student_logp - teacher_logp) and adds weighted penalty
-    to advantages in-place. This is orthogonal to the base advantage estimator.
+    Computes a per-token distillation reward from the student/teacher log-probs
+    (selected by ``reward_type``) and adds the weighted reward to advantages
+    in-place. This is orthogonal to the base advantage estimator.
+
+    Reward types (all functions of student_logp and teacher_logp):
+        - "k1": teacher_logp - student_logp (the k1 reverse-KL reward; matches the
+          previous ``- opd_kl_coef * (student_logp - teacher_logp)`` behavior).
+        - "js_skew": -log(lam * exp(teacher_logp - student_logp) + (1 - lam)) with
+          lam = ``args.opd_js_mixture_weight``.
+
+    When the teacher and student use different vocabularies, some tokens may not
+    exist in the teacher's vocab and their teacher_log_probs are 0.0 placeholders.
+    ``rollout_data["teacher_valid_mask"]`` (1 = valid, 0 = invalid) gates the
+    reward: invalid tokens are not rewarded (their advantage is unchanged).
+    When the mask is absent (same-vocab case) every token is treated as valid.
 
     Args:
         args: Configuration containing `use_opd` and `opd_kl_coef`.
-        rollout_data: Dict containing "teacher_log_probs".
+        rollout_data: Dict containing "teacher_log_probs" and optionally
+            "teacher_valid_mask".
         advantages: List of advantage tensors to modify in-place.
         student_log_probs: List of student log-probability tensors.
+        reward_type: Which distillation reward to use ("k1", "k3", or "js_skew").
 
     References:
         https://github.com/thinking-machines-lab/tinker-cookbook/blob/main/tinker_cookbook/distillation/train_on_policy.py
@@ -561,14 +591,48 @@ def apply_opd_kl_to_advantages(
     device = student_log_probs[0].device
     teacher_log_probs = [t.to(device=device) for t in teacher_log_probs]
 
+    valid_masks = rollout_data.get("teacher_valid_mask", None)  # None in same-vocab case
+
+    if reward_type == "k1":
+        reward_func = _k1_reward
+    elif reward_type == "js_skew":
+        lam = getattr(args, "opd_js_mixture_weight", 0.5)
+        # _js_skew_reward returns -log(u) = the score-function gradient coefficient of the
+        # skew-JS divergence (a LOSS direction, i.e. a *negative* reward). In reward mode the
+        # value is added to advantages and MAXIMISED, so negate it to a proper reward
+        # +log(u) = log(m_lambda / pi_s). At lam=1 this is log(pi_t / pi_s) =
+        # teacher_logp - student_logp, exactly matching the k1 reward's sign/direction.
+        reward_func = lambda s_lp, t_lp: -_js_skew_reward(s_lp, t_lp, lam=lam)
+    else:
+        raise ValueError(f"Unknown OPD reward_type: {reward_type!r}. Choose one of: k1, js_skew.")
+
     reverse_kls = []
+    opd_rewards = []
+    agg_masks: list[torch.Tensor] = []
     for i, adv in enumerate(advantages):
         reverse_kl = student_log_probs[i] - teacher_log_probs[i]
-        advantages[i] = adv - args.opd_kl_coef * reverse_kl
+        opd_reward = reward_func(student_log_probs[i], teacher_log_probs[i])
+        valid = None
+        if valid_masks is not None:
+            valid = valid_masks[i]
+            if not torch.is_tensor(valid):
+                valid = torch.tensor(valid, dtype=torch.float32, device=device)
+            else:
+                valid = valid.to(dtype=torch.float32, device=device)
+            # Gate BOTH the logged reverse KL and the applied reward so invalid
+            # cross-vocab tokens (teacher_log_probs=0.0 placeholders) leave the
+            # advantage unchanged.
+            reverse_kl = reverse_kl * valid
+            opd_reward = opd_reward * valid
         reverse_kls.append(reverse_kl)
+        opd_rewards.append(opd_reward)
+
+    for i in range(len(advantages)):
+        advantages[i] = advantages[i] + args.opd_kl_coef * opd_rewards[i]
 
     # Store reverse KL for logging
     rollout_data["opd_reverse_kl"] = reverse_kls
+    rollout_data[f"opd_reward_{reward_type}"] = opd_rewards
 
 
 def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) -> None:
@@ -634,7 +698,17 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
 
     elif args.advantage_estimator in ["grpo", "gspo"]:
         rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
-        returns = get_grpo_returns(rewards, kl)
+        if getattr(args, "grpo_per_step_discount", False) and args.gamma < 1.0:
+            returns = get_grpo_per_step_returns(
+                rewards=rewards,
+                kl=kl,
+                loss_masks=loss_masks,
+                response_lengths=response_lengths,
+                total_lengths=total_lengths,
+                gamma=args.gamma,
+            )
+        else:
+            returns = get_grpo_returns(rewards, kl)
         # TODO: is the copy necessary?
         advantages = [r for r in returns]
 
@@ -675,16 +749,36 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
         )
         returns = advantages
 
+    elif args.advantage_estimator == "on_policy_distillation":
+        student_log_probs = log_probs
+        teacher_log_probs = rollout_data.get("teacher_log_probs")
+        response_lengths = rollout_data.get("response_lengths")
+        device = student_log_probs[0].device
+        teacher_log_probs = [t_log_prob.to(device=device) for t_log_prob in teacher_log_probs]
+        teacher_log_probs = [
+            t_log_prob[-response_length:]
+            for t_log_prob, response_length in zip(teacher_log_probs, response_lengths, strict=False)
+        ]
+        advantages = [
+            teacher_log_prob - student_log_prob
+            for teacher_log_prob, student_log_prob in zip(teacher_log_probs, student_log_probs, strict=False)
+        ]
+        returns = advantages
+
     else:
         raise NotImplementedError(f"advantage_estimator {args.advantage_estimator} is not supported. ")
 
-    # Apply on-policy distillation KL penalty to advantages (orthogonal to advantage estimator)
-    if args.use_opd:
+    # Apply on-policy distillation KL penalty to advantages (orthogonal to advantage estimator).
+    # Only in the "reward" OPD mode: the reverse-KL penalty is folded into advantages here. In the
+    # "loss" mode the distillation signal is instead added as a separate loss term in policy_loss(),
+    # so we must NOT also modify advantages (that would double-count the teacher signal).
+    if args.use_opd and getattr(args, "opd_mode", "loss") == "reward":
         apply_opd_kl_to_advantages(
             args=args,
             rollout_data=rollout_data,
             advantages=advantages,
             student_log_probs=log_probs,
+            reward_type=getattr(args, "opd_reward_type", "k1"),
         )
 
     # TODO: OpenRLHF always does advantages normalization but veRL doesn't seem to do it.
@@ -960,7 +1054,6 @@ def policy_loss_function(
 
     pg_loss = pg_loss_reducer(pg_loss)
     pg_clipfrac = sum_of_sample_mean(pg_clipfrac)
-    ppo_kl = sum_of_sample_mean(ppo_kl)
 
     # entropy loss
     entropy = log_probs_and_entropy["entropy"]
@@ -968,6 +1061,22 @@ def policy_loss_function(
     entropy_loss = sum_of_sample_mean(entropy)
 
     loss = pg_loss - args.entropy_coef * entropy_loss
+
+    zero_train_adv_for_opd = getattr(args, "zero_train_adv_for_opd", False)
+    if args.use_opd and getattr(args, "opd_mode", "loss") == "loss":
+        loss_type = getattr(args, "opd_reverse_kl_loss_type", "fkl")
+        # `opd_out.loss` is the differentiable REINFORCE surrogate for the reverse KL.
+        opd_out = compute_reverse_kl(args, batch, log_probs, ppo_kl, sum_of_sample_mean, loss_type)
+        reverse_kl = opd_out.kl_value
+        opd_loss = opd_out.loss
+        if zero_train_adv_for_opd:
+            loss = opd_loss
+        else:
+            loss += args.opd_kl_coef * opd_loss
+    else:
+        reverse_kl = torch.tensor(0.0, device=logits.device)
+
+    ppo_kl = sum_of_sample_mean(ppo_kl)
 
     if args.use_kl_loss:
         ref_log_probs = batch["ref_log_probs"]
@@ -1000,6 +1109,7 @@ def policy_loss_function(
         "entropy_loss": entropy_loss.clone().detach(),
         "pg_clipfrac": pg_clipfrac.clone().detach(),
         "ppo_kl": ppo_kl.clone().detach(),
+        "rev_kl": reverse_kl.clone().detach(),
     }
 
     if train_rollout_logprob_abs_diff is not None:
@@ -1135,6 +1245,87 @@ def sft_loss_function(
             "loss": loss.clone().detach(),
         },
     )
+
+
+@dataclass
+class OpdKLOutput:
+    """Result of an OPD KL objective (reverse-KL surrogate or top-k forward KL).
+
+    Attributes:
+        loss: Differentiable training term (reduced by ``sum_of_sample_mean``).
+        kl_value: Gradient-free KL value for logging — ``rev_kl`` for the reverse-KL
+            surrogate, ``forward_kl`` for the top-k forward KL.
+        valid_ratio: Top-k mode only — fraction of trained (loss-masked) tokens that
+            carried a teacher top-k signal (``forward_kl_valid_ratio``); the
+            un-diluted per-valid-token KL is ``kl_value / valid_ratio``. ``None`` for
+            the reverse-KL path.
+    """
+
+    loss: torch.Tensor
+    kl_value: torch.Tensor
+    valid_ratio: torch.Tensor | None = None
+
+
+def compute_reverse_kl(
+        args: Namespace,
+        batch: RolloutBatch,
+        student_log_probs: torch.Tensor,
+        ppo_kl: torch.Tensor,
+        sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+        reverse_kl_loss_type: str,
+) -> OpdKLOutput:
+    ref_log_probs: list[torch.Tensor] = batch.get("teacher_log_probs", None)  # type: ignore[assignment]
+    if ref_log_probs is None:
+        raise ValueError(
+            "OPD requires reference log-probabilities, but 'teacher_log_probs' "
+            "is missing from the batch. Make sure the SFT rollout reads 'ref_log_probs' from "
+            "sample.metadata and stores them in sample.teacher_log_probs."
+        )
+
+    valid_masks: list[torch.Tensor] = batch.get("teacher_valid_mask", None)  # type: ignore[assignment]
+    if valid_masks is None:
+        warnings.warn(
+            "OPD: 'teacher_valid_mask' is missing from the batch. "
+            "Treating all tokens as valid (same-vocab case)."
+        )
+
+    teacher_log_probs = torch.cat(ref_log_probs, dim=0)
+    reverse_kl = student_log_probs - teacher_log_probs
+
+    if valid_masks is not None:
+        mask = torch.cat(valid_masks, dim=0)
+    else:
+        mask = torch.ones_like(reverse_kl, dtype=torch.float32, device=reverse_kl.device)
+
+    clip_imp_ratio = torch.clip((-ppo_kl).exp(), min=0.0, max=100.0)
+    if reverse_kl_loss_type == "k1":
+        reward_coef = reverse_kl.detach()
+        surrogate = clip_imp_ratio * reward_coef
+    elif reverse_kl_loss_type == "k2":
+        surrogate = 0.5 * (clip_imp_ratio.detach() * reverse_kl).pow(2)
+    elif reverse_kl_loss_type == "k3":
+        surrogate = clip_imp_ratio * ((-reverse_kl).exp().clamp(min=0.0, max=100.0) - 1.0 + reverse_kl)
+    elif reverse_kl_loss_type == "js_skew":
+        lam = float(getattr(args, "opd_js_mixture_weight", 0.5))
+        assert 0.0 < lam <= 1.0, f"opd_js_mixture_weight must be in (0, 1], got {lam}"
+        ratio = (-reverse_kl).exp().clamp(min=0.0, max=100.0)
+        u = lam * ratio + (1.0 - lam)
+        log_u = u.clamp_min(1e-8).log()
+        reward_coef = (-log_u).detach()
+        surrogate = clip_imp_ratio.detach() * reward_coef * student_log_probs
+    else:
+        raise ValueError(
+            f"Unknown opd_reverse_kl_loss_type: {reverse_kl_loss_type}. "
+            "Choose one of: k1, k2, k3, js_skew."
+        )
+
+    mask_bool = mask.bool()
+    rkl_loss = torch.where(mask_bool, surrogate, torch.zeros_like(surrogate))
+
+    # True reverse-KL value (gradient-free), masked identically, for logging.
+    kl_value = torch.where(mask_bool, reverse_kl.detach(), torch.zeros_like(reverse_kl))
+    return OpdKLOutput(loss=sum_of_sample_mean(rkl_loss), kl_value=sum_of_sample_mean(kl_value))
+
 
 
 def loss_function(

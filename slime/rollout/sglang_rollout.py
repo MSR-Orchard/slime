@@ -1,7 +1,10 @@
 import asyncio
 import copy
 import inspect
+import json
 import logging
+import math
+import os
 import uuid
 from argparse import Namespace
 from collections.abc import Callable
@@ -108,7 +111,12 @@ class GenerateState(metaclass=SingletonMeta):
 
         if getattr(args, "sglang_enable_deterministic_inference", False):
             sampling_seed_base = args.rollout_seed
-            self.group_sampling_seeds = [sampling_seed_base + i for i in range(args.n_samples_per_prompt)]
+            n_seeds = getattr(args, "n_samples_per_prompt_max", None) or args.n_samples_per_prompt
+            self.group_sampling_seeds = [sampling_seed_base + i for i in range(n_seeds)]
+
+        # dp rank balancing
+        self.dp_counts = [0] * (args.sglang_dp_size or 1)
+        self.dp_rank = 0
 
         # dp rank balancing
         self.dp_counts = [0] * (args.sglang_dp_size or 1)
@@ -132,20 +140,28 @@ class GenerateState(metaclass=SingletonMeta):
         self.remaining_batch_size = 0
         self.pendings = set()
         self.aborted = False
+        # Current rollout (RL) step id, set by generate_rollout_async / eval_rollout
+        # so custom generate functions can access it (e.g. to organize trajectory dumps).
+        self.rollout_id = None
 
     def submit_generate_tasks(self, samples: list[list[Sample]]) -> None:
+        use_progressive = getattr(self.args, "n_samples_per_prompt_max", None) is not None
         for group in samples:
-            self.pendings.add(
-                asyncio.create_task(
-                    # submit a group of samples as a single task.
-                    generate_and_rm_group(
-                        self.args,
-                        group,
-                        sampling_params=self.sampling_params.copy(),
-                        evaluation=False,
-                    )
+            if use_progressive:
+                coro = progressive_generate_and_rm_group(
+                    self.args,
+                    group,
+                    sampling_params=self.sampling_params.copy(),
+                    evaluation=False,
                 )
-            )
+            else:
+                coro = generate_and_rm_group(
+                    self.args,
+                    group,
+                    sampling_params=self.sampling_params.copy(),
+                    evaluation=False,
+                )
+            self.pendings.add(asyncio.create_task(coro))
         self.remaining_batch_size += len(samples)
 
 
@@ -349,6 +365,214 @@ async def generate_and_rm_group(
     return group
 
 
+def _sample_sort_key(sample: Sample) -> int:
+    """Sort key for ranking samples (lower is better):
+      0 = completed
+      1 = truncated (context limit or unknown reason)
+      2 = truncated (time limit)
+      3 = aborted
+    """
+    if sample.status == Sample.Status.COMPLETED:
+        return 0
+    if sample.status == Sample.Status.TRUNCATED:
+        exit_status = None
+        if hasattr(sample, "metadata") and isinstance(sample.metadata, dict):
+            exit_status = sample.metadata.get("exit_status")
+        if exit_status == "TimeExceeded":
+            return 2
+        return 1
+    # ABORTED or any unexpected status
+    return 3
+
+
+def _try_select_training_group(
+    args: Namespace,
+    all_samples: list[Sample],
+    train_size: int,
+    pos_ratio_min: float,
+    pos_ratio_max: float,
+) -> tuple[list[Sample] | None, list[Sample]]:
+    """Try to select a training group of `train_size` samples from `all_samples`
+    such that the fraction of positive-reward samples is between pos_ratio_min and pos_ratio_max.
+
+    Maintains two ranked lists (positive / negative), each sorted by:
+      1) Status: completed > truncated/aborted
+      2) Response length: shorter first
+    Picks top samples from each list targeting the ideal ratio (min+max)/2.
+
+    Returns a tuple of (selected_samples_or_None, all_samples_sorted).
+    """
+    positive_samples = []
+    negative_samples = []
+    backfill_samples = []
+    for s in all_samples:
+        if s.reward is None or s.status == Sample.Status.ABORTED:
+            backfill_samples.append(s)
+            continue
+        exit_status = (s.metadata or {}).get("exit_status") if isinstance(getattr(s, "metadata", None), dict) else None
+        if exit_status == "TimeExceeded":
+            backfill_samples.append(s)
+            continue
+        reward_val = s.get_reward_value(args)
+        if reward_val is not None and reward_val > 0:
+            positive_samples.append(s)
+        else:
+            negative_samples.append(s)
+    
+    # Sort both lists: completed first, then by shorter response length
+    positive_samples.sort(key=_sample_sort_key)
+    negative_samples.sort(key=_sample_sort_key)
+    backfill_samples.sort(key=_sample_sort_key)
+
+    all_samples_sorted = positive_samples + negative_samples + backfill_samples
+    
+    if len(positive_samples) + len(negative_samples) < train_size:
+        return None, all_samples_sorted
+
+    # Compute the ideal number of positives, then search outward for a feasible count
+    ideal_ratio = (pos_ratio_min + pos_ratio_max) / 2
+    ideal_n_pos = round(ideal_ratio * train_size)
+
+    min_pos = math.ceil(pos_ratio_min * train_size)
+    max_pos = math.floor(pos_ratio_max * train_size)
+
+    # Find feasible n_pos closest to ideal ratio
+    best_n_pos = None
+    for n_pos in sorted(range(min_pos, max_pos + 1), key=lambda x: abs(x - ideal_n_pos)):
+        n_neg = train_size - n_pos
+        if n_pos <= len(positive_samples) and n_neg <= len(negative_samples):
+            best_n_pos = n_pos
+            break
+
+    if best_n_pos is None:
+        return None, all_samples_sorted
+
+    n_neg = train_size - best_n_pos
+    # Pick top-ranked samples from each sorted list
+    selected = positive_samples[:best_n_pos] + negative_samples[:n_neg]
+    return selected, all_samples_sorted
+
+
+async def progressive_generate_and_rm_group(
+    args: Namespace,
+    group: list[Sample],
+    sampling_params: dict[str, Any],
+    evaluation: bool = False,
+) -> list[Sample]:
+    """Progressive rollout: generate samples in strides and early-stop when a good training group
+    can be assembled from the results.
+
+    The group passed in has `n_samples_per_prompt` (= train size) samples. We generate up to
+    `n_samples_per_prompt_max` samples total, in increments of `n_samples_per_prompt_stride`.
+    After each stride, we check if we can select a training group satisfying the positive ratio
+    constraint. If yes, we return the selected group. If we exhaust all strides without finding
+    a valid group, we return the best available selection or the original group.
+    """
+    state = GenerateState(args)
+
+    if state.aborted:
+        return group
+
+    stride = args.n_samples_per_prompt_stride
+    max_samples = args.n_samples_per_prompt_max
+    train_size = args.n_samples_per_prompt
+    pos_ratio_min = args.progressive_rollout_pos_ratio_min
+    pos_ratio_max = args.progressive_rollout_pos_ratio_max
+
+    # Use the first sample as a template for creating additional copies
+    template_sample = group[0]
+
+    # Build the full set of samples we may generate (up to max_samples)
+    all_pending_samples = list(group)  # first n_samples_per_prompt samples
+    # Create additional samples beyond the initial group
+    base_index = template_sample.index
+    for i in range(len(group), max_samples):
+        sample = copy.deepcopy(template_sample)
+        sample.index = base_index + i
+        sample.status = Sample.Status.PENDING
+        sample.response = ""
+        sample.response_length = 0
+        sample.tokens = []
+        sample.rollout_log_probs = None
+        sample.reward = None
+        sample.weight_versions = []
+        all_pending_samples.append(sample)
+
+    all_completed = []
+
+    # Generate in strides
+    for stride_start in range(0, max_samples, stride):
+        if state.aborted:
+            break
+
+        stride_end = min(stride_start + stride, max_samples)
+        stride_group = all_pending_samples[stride_start:stride_end]
+
+        # Generate this stride using the existing generate_and_rm_group logic
+        tasks = []
+        for idx, sample in enumerate(stride_group):
+            current_sampling_params = sampling_params.copy()
+            if getattr(args, "sglang_enable_deterministic_inference", False):
+                # Use distinct seeds across all strides
+                seed_idx = stride_start + idx
+                if seed_idx < len(state.group_sampling_seeds):
+                    current_sampling_params["sampling_seed"] = state.group_sampling_seeds[seed_idx]
+                else:
+                    current_sampling_params["sampling_seed"] = args.rollout_seed + seed_idx
+            tasks.append(generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation))
+
+        stride_results = await asyncio.gather(*tasks)
+
+        # For group_rm, compute rewards per stride so _try_select_training_group can classify samples
+        if not state.aborted and args.group_rm:
+            rewards = await batched_async_rm(args, stride_results)
+            for sample, reward in zip(stride_results, rewards, strict=False):
+                sample.reward = reward
+
+        all_completed.extend(stride_results)
+
+        # Try to assemble a valid training group from all completed samples so far
+        selected, _ = _try_select_training_group(args, all_completed, train_size, pos_ratio_min, pos_ratio_max)
+        if selected is not None:
+            logger.info(
+                f"Progressive rollout: assembled training group after {len(all_completed)}/{max_samples} samples "
+                f"(stride {stride_start // stride + 1})"
+            )
+            if args.group_rm:
+                rewards = await batched_async_rm(args, selected)
+                for sample, reward in zip(selected, rewards, strict=False):
+                    sample.reward = reward
+            return selected
+
+    # If aborted, return the original group
+    if state.aborted:
+        return group
+
+    # Exhausted all strides without finding a valid group.
+    # Fallback: try with fully relaxed constraints (any positive ratio)
+    selected, all_samples_sorted = _try_select_training_group(args, all_completed, train_size, 0, 1)
+    if selected is not None:
+        fallback_selected = selected
+    else:
+        logger.warning(
+            f"Progressive rollout: not enough valid samples from {len(all_completed)} completed, "
+            f"need {train_size}."
+        )
+        fallback_selected = all_samples_sorted[:train_size]
+
+    logger.warning(
+        f"Progressive rollout: could not assemble balanced group from {len(all_completed)} samples. "
+        f"Returning fallback group with relaxed constraints."
+    )
+
+    if args.group_rm:
+        rewards = await batched_async_rm(args, fallback_selected)
+        for sample, reward in zip(fallback_selected, rewards, strict=False):
+            sample.reward = reward
+
+    return fallback_selected
+
+
 async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
     aborted_samples = []
 
@@ -393,6 +617,43 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
     return aborted_samples
 
 
+def _save_group_info(group: list[Sample]) -> None:
+    """Save per-sample debug info for a group as JSONL before filtering."""
+    group_info_path = None
+    for s in group:
+        sample = s[0] if isinstance(s, list) else s
+        path = getattr(sample, "metadata", {}).get("group_info_path")
+        if path:
+            group_info_path = path
+            break
+    if not group_info_path:
+        return
+
+    try:
+        from datetime import datetime
+        saved_at = datetime.now().isoformat()
+        os.makedirs(os.path.dirname(group_info_path), exist_ok=True)
+        with open(group_info_path, "a") as f:
+            for s in group:
+                sample = s[0] if isinstance(s, list) else s
+                metadata = getattr(sample, "metadata", None) or {}
+                reward = getattr(sample, "reward", None)
+                status = getattr(sample, "status", None)
+                info = {
+                    "saved_at": saved_at,
+                    "exit_status": metadata.get("exit_status"),
+                    "reward": reward if not isinstance(reward, dict) else {k: v for k, v in reward.items()},
+                    "status": status.name if isinstance(status, Sample.Status) else str(status),
+                    "trajectory_path": metadata.get("trajectory_path"),
+                    "sample_index": getattr(sample, "index", None),
+                    "token_length": getattr(sample, "response_length", None),
+                }
+                f.write(json.dumps(info, default=str) + "\n")
+        logger.info("Saved group info to %s", group_info_path)
+    except Exception as e:
+        logger.warning("Failed to save group info to %s: %s", group_info_path, e)
+
+
 async def generate_rollout_async(
     args: Namespace, rollout_id: int, data_source: Callable[[int], list[list[Sample]]]
 ) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
@@ -411,6 +672,8 @@ async def generate_rollout_async(
     assert args.rollout_global_dataset
 
     state = GenerateState(args)
+    # expose the current rollout (RL) step to custom generate functions
+    state.rollout_id = rollout_id
 
     # instantiate data filters
     dynamic_filter = (
@@ -427,6 +690,7 @@ async def generate_rollout_async(
     do_print = True
     pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc="Rollout generation")
     while len(data) < target_data_size:
+        logger.info(f"len(data)={len(data)}, target_data_size={target_data_size}")
         while state.remaining_batch_size < target_data_size:
             # get samples from the buffer and submit the generation requests.
             samples = data_source(args.over_sampling_batch_size)
@@ -446,6 +710,7 @@ async def generate_rollout_async(
 
             assert len(group) == args.n_samples_per_prompt
             all_data.append(group)
+            _save_group_info(group)
             dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group)
             if not dynamic_filter_output.keep:
                 metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
@@ -517,6 +782,9 @@ async def eval_rollout_single_dataset(
 
     global EVAL_PROMPT_DATASET
 
+    # expose the current rollout (RL) step to custom generate functions
+    GenerateState(args).rollout_id = rollout_id
+
     cache_key = dataset_cfg.cache_key + (args.hf_checkpoint, args.apply_chat_template)
     if cache_key not in EVAL_PROMPT_DATASET:
         tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
@@ -551,11 +819,21 @@ async def eval_rollout_single_dataset(
     tasks = []
     # do multiple samples for eval prompts
     sample_index = 0
+    # Optional cap on concurrent eval generations (defaults to 128).
+    eval_max_concurrency = getattr(args, "eval_max_concurrency", 128)
+    eval_semaphore = asyncio.Semaphore(eval_max_concurrency) if eval_max_concurrency else None
+
+    async def _gen(sample, sampling_params):
+        if eval_semaphore is None:
+            return await generate_and_rm(args, sample, sampling_params=sampling_params, evaluation=True)
+        async with eval_semaphore:
+            return await generate_and_rm(args, sample, sampling_params=sampling_params, evaluation=True)
+
     for _i, prompt_sample in enumerate(dataset.samples):
         for j in range(dataset_cfg.n_samples_per_eval_prompt):
             # use the same prompt for multiple samples
             sample = copy.deepcopy(prompt_sample)
-            sample.index = sample_index
+            sample.index = sample_index + rollout_id * 100000  # make sure different rollout has different sample index
             sample_index += 1
             sample.metadata = dataset_cfg.inject_metadata(getattr(sample, "metadata", None))
             sample.generate_function_path = getattr(dataset_cfg, "custom_generate_function_path", None)
@@ -565,12 +843,7 @@ async def eval_rollout_single_dataset(
                 sampling_params["sampling_seed"] = args.rollout_seed + j
             tasks.append(
                 asyncio.create_task(
-                    generate_and_rm(
-                        args,
-                        sample,
-                        sampling_params=sampling_params,
-                        evaluation=True,
-                    )
+                    _gen(sample, sampling_params)
                 )
             )
 
