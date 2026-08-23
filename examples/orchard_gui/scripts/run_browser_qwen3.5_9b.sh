@@ -7,11 +7,20 @@
 # Method:  GRPO with LLM-as-a-Judge reward on WebGym tasks (eval: Online-Mind2Web)
 #
 # Model details:
-#   - Dense 9B language model (no <think> traces — shorter per-turn budget than 4B-Thinking)
+#   - Dense 9B vision-language model (Qwen3_5ForConditionalGeneration): early-fusion
+#     VLM with a native vision encoder — no separate "-VL" variant exists for Qwen3.5.
+#     (No <think> traces — shorter per-turn budget than 4B-Thinking.)
 #   - Megatron shards across 4 TP ranks for training (2 DP replicas on 8 GPUs)
 #   - 8 parallel SGLang engines for rollout (1 GPU each)
-#   - NOTE: the Megatron spec scripts/models/qwen3.5-9B.sh is language-only.
-#     The browser task is vision-dependent — see the risk note in section 4.
+#   - Vision tower IS trained: --megatron-to-hf-mode bridge builds the full VL model
+#     (megatron-bridge Qwen35VLBridge -> Qwen3VLModel, vision + language), rollout
+#     screenshots reach the training forward via multimodal_train_inputs, nothing is
+#     frozen, and bridge weight sync/save exports model.visual.* along with the LM.
+#   - NOTE: the language-only spec scripts/models/qwen3.5-9B.sh sourced below is NOT
+#     used to build the model in bridge mode (model_provider builds from the HF config
+#     via AutoBridge). Do not switch this script to direct mode: the direct converter
+#     (megatron_to_hf/qwen3_5.py) has no vision mappings, so the vision tower would
+#     silently be dropped from training, weight sync, and --save-hf exports.
 #
 # Usage:
 #   bash examples/orchard_gui/scripts/run_browser_qwen3.5_9b.sh
@@ -93,9 +102,11 @@ pkill -9 slime || true; pkill -9 redis || true
 
 # This run uses --megatron-to-hf-mode bridge (set in BACKEND_ARGS): bridge builds the
 # model through the HF config at load time, instead of the raw HF→torch_dist conversion.
-# RISK: scripts/models/qwen3.5-9B.sh is a language-only spec, so this builds a text-only
-# model that cannot consume screenshot pixel_values. Confirm the browser task is driven by
-# text observations (DOM/accessibility) — otherwise the agent is effectively blind.
+# Since Qwen/Qwen3.5-9B is a Qwen3_5ForConditionalGeneration VLM, AutoBridge picks
+# Qwen35VLBridge and builds the full vision+language Qwen3VLModel — the language-only
+# spec in scripts/models/qwen3.5-9B.sh is ignored for model construction in bridge mode.
+# Screenshot pixel_values from rollout are consumed in the training forward, and the
+# vision tower is trained and synced along with the LM (nothing is frozen).
 
 if [ "${EXTERNAL_RAY}" != "1" ]; then
     export no_proxy="127.0.0.1,${MASTER_ADDR}"
